@@ -29,12 +29,28 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 - `Include description`: description/summary 포함 여부
 - `Description max length`: description 최대 길이
 - `Write empty notes`: 결과가 없어도 빈 리포트 생성 여부
+- `Enable RSS Dashboard sync`: RSS Dashboard에 추가한 피드를 자동 동기화
+- `RSS Dashboard data path`: 기본값 `.obsidian/plugins/rss-dashboard/data.json`
 - `Feeds`: topic/name/url/enabled 관리
 
 ## Commands
 
 - `Run due RSS window captures now`
 - `Capture latest completed RSS window now`
+- `Sync feeds from RSS Dashboard now`
+
+## RSS Dashboard 연동
+
+1. RSS Dashboard 플러그인이 같은 Vault에 설치되어 있어야 합니다.
+2. RSS Insight 설정에서 `Enable RSS Dashboard sync`를 켭니다.
+3. 기본 경로 `.obsidian/plugins/rss-dashboard/data.json`를 유지합니다.
+4. `Sync feeds from RSS Dashboard now` 명령을 실행하거나, RSS Insight 자동 실행 시 동기화됩니다.
+
+동기화 규칙:
+
+- RSS Dashboard에 새로 추가된 feed는 RSS Insight에 자동 생성됩니다.
+- feed 주제(topic)는 RSS Dashboard의 folder 값을 기본으로 사용합니다.
+- 같은 URL이 수동 feed와 겹치면 수동 feed를 우선합니다.
 
 ## Build
 

@@ -1,6 +1,6 @@
 {
   "name": "obsidian-rss-insight",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Collect RSS items by scheduled windows and save them to Obsidian notes",
   "main": "main.js",
   "scripts": {

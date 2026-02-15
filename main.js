@@ -33,12 +33,31 @@ var DEFAULT_SETTINGS = {
   descriptionMaxLength: 500,
   writeEmptyNote: true,
   lastWindowEndIso: "",
+  rssDashboardSyncEnabled: true,
+  rssDashboardDataPath: ".obsidian/plugins/rss-dashboard/data.json",
+  rssDashboardLastSyncAtIso: "",
+  rssDashboardLastMtime: 0,
   feeds: []
 };
 var SCHEDULER_TICK_MS = 60 * 1e3;
 var MAX_CATCHUP_WINDOWS = 10;
 function createFeedId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+function buildDeterministicFeedId(url) {
+  let hash = 5381;
+  for (let i = 0; i < url.length; i += 1) {
+    hash = (hash << 5) + hash ^ url.charCodeAt(i);
+  }
+  const unsigned = hash >>> 0;
+  return `rssd-${unsigned.toString(36)}`;
+}
+function normalizeTopic(raw) {
+  const cleaned = raw.trim();
+  if (!cleaned) {
+    return "Uncategorized";
+  }
+  return cleaned;
 }
 function pad2(value) {
   return String(value).padStart(2, "0");
@@ -179,6 +198,13 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
         void this.captureLatestCompletedWindow();
       }
     });
+    this.addCommand({
+      id: "sync-feeds-from-rss-dashboard",
+      name: "Sync feeds from RSS Dashboard now",
+      callback: () => {
+        void this.syncFeedsFromRssDashboard(true, true);
+      }
+    });
     this.addRibbonIcon("rss", "Run due RSS window captures now", () => {
       void this.runDueWindows("manual");
     });
@@ -191,6 +217,9 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
       }, SCHEDULER_TICK_MS)
     );
     const startupTimer = window.setTimeout(() => {
+      if (this.settings.rssDashboardSyncEnabled) {
+        void this.syncFeedsFromRssDashboard(false, false);
+      }
       if (!this.settings.autoFetchEnabled) {
         return;
       }
@@ -203,14 +232,93 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
     this.settings.feeds = (this.settings.feeds || []).map((feed) => ({
       id: feed.id || createFeedId(),
-      topic: (feed.topic || "Uncategorized").trim() || "Uncategorized",
+      topic: normalizeTopic(feed.topic || "Uncategorized"),
       name: (feed.name || "").trim(),
       url: (feed.url || "").trim(),
-      enabled: feed.enabled !== false
+      enabled: feed.enabled !== false,
+      source: feed.source === "rss-dashboard" ? "rss-dashboard" : "manual"
     }));
+    this.settings.rssDashboardDataPath = (this.settings.rssDashboardDataPath || DEFAULT_SETTINGS.rssDashboardDataPath).trim() || DEFAULT_SETTINGS.rssDashboardDataPath;
   }
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+  async syncFeedsFromRssDashboard(force, showNotice) {
+    var _a, _b, _c;
+    if (!this.settings.rssDashboardSyncEnabled) {
+      if (showNotice) {
+        new import_obsidian.Notice("RSS Dashboard sync is disabled.");
+      }
+      return false;
+    }
+    const dataPath = (0, import_obsidian.normalizePath)(
+      this.settings.rssDashboardDataPath.trim() || DEFAULT_SETTINGS.rssDashboardDataPath
+    );
+    try {
+      const adapter = this.app.vault.adapter;
+      const exists = await adapter.exists(dataPath);
+      if (!exists) {
+        if (showNotice) {
+          new import_obsidian.Notice(`RSS Dashboard data not found: ${dataPath}`);
+        }
+        return false;
+      }
+      const stat = await adapter.stat(dataPath);
+      const mtime = (_a = stat == null ? void 0 : stat.mtime) != null ? _a : 0;
+      if (!force && mtime > 0 && mtime <= this.settings.rssDashboardLastMtime) {
+        return false;
+      }
+      const raw = await adapter.read(dataPath);
+      const parsed = JSON.parse(raw);
+      const dashboardFeeds = Array.isArray(parsed.feeds) ? parsed.feeds : [];
+      const manualFeeds = this.settings.feeds.filter((feed) => feed.source !== "rss-dashboard");
+      const manualUrlSet = new Set(
+        manualFeeds.map((feed) => feed.url.trim()).filter((url) => url.length > 0)
+      );
+      const existingSyncedByUrl = new Map(
+        this.settings.feeds.filter((feed) => feed.source === "rss-dashboard").map((feed) => [feed.url.trim(), feed])
+      );
+      const nextSyncedByUrl = /* @__PURE__ */ new Map();
+      for (const record of dashboardFeeds) {
+        const url = typeof record.url === "string" ? record.url.trim() : "";
+        if (!url || manualUrlSet.has(url) || nextSyncedByUrl.has(url)) {
+          continue;
+        }
+        const existing = existingSyncedByUrl.get(url);
+        const title = typeof record.title === "string" ? record.title.trim() : "";
+        const folder = typeof record.folder === "string" ? record.folder : "";
+        const defaultName = title || url;
+        const defaultTopic = normalizeTopic(folder || "Uncategorized");
+        nextSyncedByUrl.set(url, {
+          id: (existing == null ? void 0 : existing.id) || buildDeterministicFeedId(url),
+          topic: ((_b = existing == null ? void 0 : existing.topic) == null ? void 0 : _b.trim()) ? existing.topic.trim() : defaultTopic,
+          name: ((_c = existing == null ? void 0 : existing.name) == null ? void 0 : _c.trim()) ? existing.name.trim() : defaultName,
+          url,
+          enabled: existing ? existing.enabled : true,
+          source: "rss-dashboard"
+        });
+      }
+      const syncedFeeds = Array.from(nextSyncedByUrl.values());
+      const nextFeeds = [...manualFeeds, ...syncedFeeds];
+      const changed = JSON.stringify(this.settings.feeds) !== JSON.stringify(nextFeeds) || this.settings.rssDashboardLastMtime !== mtime;
+      this.settings.rssDashboardLastMtime = mtime;
+      this.settings.rssDashboardLastSyncAtIso = (/* @__PURE__ */ new Date()).toISOString();
+      if (changed) {
+        this.settings.feeds = nextFeeds;
+      }
+      await this.saveSettings();
+      if (showNotice) {
+        const suffix = changed ? "" : " (no feed changes)";
+        new import_obsidian.Notice(`Synced ${syncedFeeds.length} feed(s) from RSS Dashboard${suffix}.`, 5e3);
+      }
+      return changed;
+    } catch (error) {
+      console.error("[rss-insight] dashboard sync failure", error);
+      if (showNotice) {
+        new import_obsidian.Notice("Failed to sync from RSS Dashboard. Check console logs.", 8e3);
+      }
+      return false;
+    }
   }
   async runDueWindows(reason) {
     if (this.runInProgress) {
@@ -219,6 +327,7 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
       }
       return;
     }
+    await this.syncFeedsFromRssDashboard(false, false);
     const enabledFeeds = this.settings.feeds.filter(
       (feed) => feed.enabled && feed.url.trim().length > 0
     );
@@ -275,6 +384,7 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice("RSS window capture is already running.");
       return;
     }
+    await this.syncFeedsFromRssDashboard(false, false);
     const enabledFeeds = this.settings.feeds.filter(
       (feed) => feed.enabled && feed.url.trim().length > 0
     );
@@ -686,6 +796,29 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
         this.display();
       })
     );
+    containerEl.createEl("h3", { text: "RSS Dashboard Sync" });
+    new import_obsidian.Setting(containerEl).setName("Enable RSS Dashboard sync").setDesc("Auto-import feed list from RSS Dashboard data.json.").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.rssDashboardSyncEnabled).onChange(async (value) => {
+        this.plugin.settings.rssDashboardSyncEnabled = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("RSS Dashboard data path").setDesc("Vault-relative path to RSS Dashboard settings file.").addText(
+      (text) => text.setPlaceholder(".obsidian/plugins/rss-dashboard/data.json").setValue(this.plugin.settings.rssDashboardDataPath).onChange(async (value) => {
+        this.plugin.settings.rssDashboardDataPath = value.trim() || DEFAULT_SETTINGS.rssDashboardDataPath;
+        await this.plugin.saveSettings();
+      })
+    );
+    const syncedFeedCount = this.plugin.settings.feeds.filter(
+      (feed) => feed.source === "rss-dashboard"
+    ).length;
+    const syncStatus = this.plugin.settings.rssDashboardLastSyncAtIso ? `Last sync: ${this.plugin.settings.rssDashboardLastSyncAtIso} / synced feeds: ${syncedFeedCount}` : `No sync yet / synced feeds: ${syncedFeedCount}`;
+    new import_obsidian.Setting(containerEl).setName("Dashboard sync status").setDesc(syncStatus).addButton(
+      (button) => button.setButtonText("Sync now").onClick(async () => {
+        await this.plugin.syncFeedsFromRssDashboard(true, true);
+        this.display();
+      })
+    );
     containerEl.createEl("h3", { text: "Feeds" });
     new import_obsidian.Setting(containerEl).setName("Add feed").setDesc("Add an RSS/Atom feed with a topic label.").addButton(
       (button) => button.setButtonText("Add").onClick(async () => {
@@ -694,7 +827,8 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
           topic: "AI",
           name: "",
           url: "",
-          enabled: true
+          enabled: true,
+          source: "manual"
         });
         await this.plugin.saveSettings();
         this.display();
@@ -708,7 +842,8 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
     }
     this.plugin.settings.feeds.forEach((feed, index) => {
       const row = containerEl.createDiv({ cls: "rss-insight-feed-row" });
-      new import_obsidian.Setting(row).setName(`Feed ${index + 1}`).setDesc("Enable or remove this feed.").addToggle(
+      const sourceLabel = feed.source === "rss-dashboard" ? "RSS Dashboard sync" : "Manual";
+      new import_obsidian.Setting(row).setName(`Feed ${index + 1}`).setDesc(`${sourceLabel} / Enable or remove this feed.`).addToggle(
         (toggle) => toggle.setValue(feed.enabled).onChange(async (value) => {
           feed.enabled = value;
           await this.plugin.saveSettings();
@@ -724,7 +859,7 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
       );
       new import_obsidian.Setting(row).setName("Topic").setDesc("Used as section heading in output notes.").addText(
         (text) => text.setValue(feed.topic).onChange(async (value) => {
-          feed.topic = value.trim() || "Uncategorized";
+          feed.topic = normalizeTopic(value);
           await this.plugin.saveSettings();
         })
       );

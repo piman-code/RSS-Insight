@@ -16,6 +16,7 @@ interface FeedSource {
   name: string;
   url: string;
   enabled: boolean;
+  source: "manual" | "rss-dashboard";
 }
 
 interface ParsedFeedItem {
@@ -40,6 +41,16 @@ interface CaptureOutcome {
   itemsWithoutDate: number;
 }
 
+interface RssDashboardFeedRecord {
+  title?: unknown;
+  url?: unknown;
+  folder?: unknown;
+}
+
+interface RssDashboardDataFile {
+  feeds?: RssDashboardFeedRecord[];
+}
+
 interface RssWindowCaptureSettings {
   autoFetchEnabled: boolean;
   scheduleTimes: string;
@@ -49,6 +60,10 @@ interface RssWindowCaptureSettings {
   descriptionMaxLength: number;
   writeEmptyNote: boolean;
   lastWindowEndIso: string;
+  rssDashboardSyncEnabled: boolean;
+  rssDashboardDataPath: string;
+  rssDashboardLastSyncAtIso: string;
+  rssDashboardLastMtime: number;
   feeds: FeedSource[];
 }
 
@@ -61,6 +76,10 @@ const DEFAULT_SETTINGS: RssWindowCaptureSettings = {
   descriptionMaxLength: 500,
   writeEmptyNote: true,
   lastWindowEndIso: "",
+  rssDashboardSyncEnabled: true,
+  rssDashboardDataPath: ".obsidian/plugins/rss-dashboard/data.json",
+  rssDashboardLastSyncAtIso: "",
+  rssDashboardLastMtime: 0,
   feeds: [],
 };
 
@@ -69,6 +88,23 @@ const MAX_CATCHUP_WINDOWS = 10;
 
 function createFeedId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function buildDeterministicFeedId(url: string): string {
+  let hash = 5381;
+  for (let i = 0; i < url.length; i += 1) {
+    hash = ((hash << 5) + hash) ^ url.charCodeAt(i);
+  }
+  const unsigned = hash >>> 0;
+  return `rssd-${unsigned.toString(36)}`;
+}
+
+function normalizeTopic(raw: string): string {
+  const cleaned = raw.trim();
+  if (!cleaned) {
+    return "Uncategorized";
+  }
+  return cleaned;
 }
 
 function pad2(value: number): string {
@@ -235,6 +271,14 @@ export default class RssWindowCapturePlugin extends Plugin {
       },
     });
 
+    this.addCommand({
+      id: "sync-feeds-from-rss-dashboard",
+      name: "Sync feeds from RSS Dashboard now",
+      callback: () => {
+        void this.syncFeedsFromRssDashboard(true, true);
+      },
+    });
+
     this.addRibbonIcon("rss", "Run due RSS window captures now", () => {
       void this.runDueWindows("manual");
     });
@@ -249,6 +293,9 @@ export default class RssWindowCapturePlugin extends Plugin {
     );
 
     const startupTimer = window.setTimeout(() => {
+      if (this.settings.rssDashboardSyncEnabled) {
+        void this.syncFeedsFromRssDashboard(false, false);
+      }
       if (!this.settings.autoFetchEnabled) {
         return;
       }
@@ -263,15 +310,113 @@ export default class RssWindowCapturePlugin extends Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
     this.settings.feeds = (this.settings.feeds || []).map((feed) => ({
       id: feed.id || createFeedId(),
-      topic: (feed.topic || "Uncategorized").trim() || "Uncategorized",
+      topic: normalizeTopic(feed.topic || "Uncategorized"),
       name: (feed.name || "").trim(),
       url: (feed.url || "").trim(),
       enabled: feed.enabled !== false,
+      source: feed.source === "rss-dashboard" ? "rss-dashboard" : "manual",
     }));
+    this.settings.rssDashboardDataPath =
+      (this.settings.rssDashboardDataPath || DEFAULT_SETTINGS.rssDashboardDataPath).trim()
+      || DEFAULT_SETTINGS.rssDashboardDataPath;
   }
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+  }
+
+  async syncFeedsFromRssDashboard(force: boolean, showNotice: boolean): Promise<boolean> {
+    if (!this.settings.rssDashboardSyncEnabled) {
+      if (showNotice) {
+        new Notice("RSS Dashboard sync is disabled.");
+      }
+      return false;
+    }
+
+    const dataPath = normalizePath(
+      this.settings.rssDashboardDataPath.trim() || DEFAULT_SETTINGS.rssDashboardDataPath,
+    );
+
+    try {
+      const adapter = this.app.vault.adapter;
+      const exists = await adapter.exists(dataPath);
+      if (!exists) {
+        if (showNotice) {
+          new Notice(`RSS Dashboard data not found: ${dataPath}`);
+        }
+        return false;
+      }
+
+      const stat = await adapter.stat(dataPath);
+      const mtime = stat?.mtime ?? 0;
+      if (!force && mtime > 0 && mtime <= this.settings.rssDashboardLastMtime) {
+        return false;
+      }
+
+      const raw = await adapter.read(dataPath);
+      const parsed = JSON.parse(raw) as RssDashboardDataFile;
+      const dashboardFeeds = Array.isArray(parsed.feeds) ? parsed.feeds : [];
+
+      const manualFeeds = this.settings.feeds.filter((feed) => feed.source !== "rss-dashboard");
+      const manualUrlSet = new Set(
+        manualFeeds.map((feed) => feed.url.trim()).filter((url) => url.length > 0),
+      );
+      const existingSyncedByUrl = new Map<string, FeedSource>(
+        this.settings.feeds
+          .filter((feed) => feed.source === "rss-dashboard")
+          .map((feed) => [feed.url.trim(), feed]),
+      );
+
+      const nextSyncedByUrl = new Map<string, FeedSource>();
+      for (const record of dashboardFeeds) {
+        const url = typeof record.url === "string" ? record.url.trim() : "";
+        if (!url || manualUrlSet.has(url) || nextSyncedByUrl.has(url)) {
+          continue;
+        }
+
+        const existing = existingSyncedByUrl.get(url);
+        const title = typeof record.title === "string" ? record.title.trim() : "";
+        const folder = typeof record.folder === "string" ? record.folder : "";
+        const defaultName = title || url;
+        const defaultTopic = normalizeTopic(folder || "Uncategorized");
+
+        nextSyncedByUrl.set(url, {
+          id: existing?.id || buildDeterministicFeedId(url),
+          topic: existing?.topic?.trim() ? existing.topic.trim() : defaultTopic,
+          name: existing?.name?.trim() ? existing.name.trim() : defaultName,
+          url,
+          enabled: existing ? existing.enabled : true,
+          source: "rss-dashboard",
+        });
+      }
+
+      const syncedFeeds = Array.from(nextSyncedByUrl.values());
+      const nextFeeds = [...manualFeeds, ...syncedFeeds];
+
+      const changed =
+        JSON.stringify(this.settings.feeds) !== JSON.stringify(nextFeeds)
+        || this.settings.rssDashboardLastMtime !== mtime;
+
+      this.settings.rssDashboardLastMtime = mtime;
+      this.settings.rssDashboardLastSyncAtIso = new Date().toISOString();
+      if (changed) {
+        this.settings.feeds = nextFeeds;
+      }
+      await this.saveSettings();
+
+      if (showNotice) {
+        const suffix = changed ? "" : " (no feed changes)";
+        new Notice(`Synced ${syncedFeeds.length} feed(s) from RSS Dashboard${suffix}.`, 5000);
+      }
+
+      return changed;
+    } catch (error) {
+      console.error("[rss-insight] dashboard sync failure", error);
+      if (showNotice) {
+        new Notice("Failed to sync from RSS Dashboard. Check console logs.", 8000);
+      }
+      return false;
+    }
   }
 
   async runDueWindows(reason: "manual" | "scheduler" | "startup" | "settings"): Promise<void> {
@@ -281,6 +426,8 @@ export default class RssWindowCapturePlugin extends Plugin {
       }
       return;
     }
+
+    await this.syncFeedsFromRssDashboard(false, false);
 
     const enabledFeeds = this.settings.feeds.filter(
       (feed) => feed.enabled && feed.url.trim().length > 0,
@@ -347,6 +494,8 @@ export default class RssWindowCapturePlugin extends Plugin {
       new Notice("RSS window capture is already running.");
       return;
     }
+
+    await this.syncFeedsFromRssDashboard(false, false);
 
     const enabledFeeds = this.settings.feeds.filter(
       (feed) => feed.enabled && feed.url.trim().length > 0,
@@ -892,6 +1041,49 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
         }),
       );
 
+    containerEl.createEl("h3", { text: "RSS Dashboard Sync" });
+
+    new Setting(containerEl)
+      .setName("Enable RSS Dashboard sync")
+      .setDesc("Auto-import feed list from RSS Dashboard data.json.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.rssDashboardSyncEnabled).onChange(async (value) => {
+          this.plugin.settings.rssDashboardSyncEnabled = value;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("RSS Dashboard data path")
+      .setDesc("Vault-relative path to RSS Dashboard settings file.")
+      .addText((text) =>
+        text
+          .setPlaceholder(".obsidian/plugins/rss-dashboard/data.json")
+          .setValue(this.plugin.settings.rssDashboardDataPath)
+          .onChange(async (value) => {
+            this.plugin.settings.rssDashboardDataPath =
+              value.trim() || DEFAULT_SETTINGS.rssDashboardDataPath;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    const syncedFeedCount = this.plugin.settings.feeds.filter(
+      (feed) => feed.source === "rss-dashboard",
+    ).length;
+    const syncStatus = this.plugin.settings.rssDashboardLastSyncAtIso
+      ? `Last sync: ${this.plugin.settings.rssDashboardLastSyncAtIso} / synced feeds: ${syncedFeedCount}`
+      : `No sync yet / synced feeds: ${syncedFeedCount}`;
+
+    new Setting(containerEl)
+      .setName("Dashboard sync status")
+      .setDesc(syncStatus)
+      .addButton((button) =>
+        button.setButtonText("Sync now").onClick(async () => {
+          await this.plugin.syncFeedsFromRssDashboard(true, true);
+          this.display();
+        }),
+      );
+
     containerEl.createEl("h3", { text: "Feeds" });
 
     new Setting(containerEl)
@@ -905,6 +1097,7 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
             name: "",
             url: "",
             enabled: true,
+            source: "manual",
           });
           await this.plugin.saveSettings();
           this.display();
@@ -920,10 +1113,11 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
 
     this.plugin.settings.feeds.forEach((feed, index) => {
       const row = containerEl.createDiv({ cls: "rss-insight-feed-row" });
+      const sourceLabel = feed.source === "rss-dashboard" ? "RSS Dashboard sync" : "Manual";
 
       new Setting(row)
         .setName(`Feed ${index + 1}`)
-        .setDesc("Enable or remove this feed.")
+        .setDesc(`${sourceLabel} / Enable or remove this feed.`)
         .addToggle((toggle) =>
           toggle.setValue(feed.enabled).onChange(async (value) => {
             feed.enabled = value;
@@ -945,7 +1139,7 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
         .setDesc("Used as section heading in output notes.")
         .addText((text) =>
           text.setValue(feed.topic).onChange(async (value) => {
-            feed.topic = value.trim() || "Uncategorized";
+            feed.topic = normalizeTopic(value);
             await this.plugin.saveSettings();
           }),
         );
