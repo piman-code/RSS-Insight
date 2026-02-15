@@ -22,6 +22,7 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 - Ollama 모델 자동 탐지 + 추천 + 드롭다운 선택
 - 번역 description은 300자 미리보기로 저장, 원문 description은 접힘(details)으로 보관
 - feed description이 비어있으면 기사 링크에서 meta/본문 문단을 보강 추출 시도
+- 주요 도메인(한국경제/동아/연합뉴스TV/코인미디어) 사이트별 본문 selector 우선 추출
 
 ## Important Limitation
 

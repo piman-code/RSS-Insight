@@ -170,6 +170,47 @@ const OLLAMA_MODEL_RECOMMENDATION_PATTERNS = [
   /mistral/i,
   /phi/i,
 ];
+const SITE_SPECIFIC_DESCRIPTION_RULES: Array<{ hosts: RegExp[]; selectors: string[] }> = [
+  {
+    hosts: [/(^|\.)hankyung\.com$/i],
+    selectors: [
+      'meta[property="og:description"]',
+      'meta[name="description"]',
+      ".article-body p",
+      ".article_txt p",
+      "article p",
+    ],
+  },
+  {
+    hosts: [/(^|\.)donga\.com$/i],
+    selectors: [
+      'meta[property="og:description"]',
+      'meta[name="description"]',
+      "#article_txt p",
+      ".article_txt p",
+      "article p",
+    ],
+  },
+  {
+    hosts: [/(^|\.)yonhapnewstv\.co\.kr$/i],
+    selectors: [
+      'meta[property="og:description"]',
+      'meta[name="description"]',
+      ".article_txt p",
+      ".news-article p",
+      "article p",
+    ],
+  },
+  {
+    hosts: [/(^|\.)coindesk\.com$/i, /(^|\.)cointelegraph\.com$/i],
+    selectors: [
+      'meta[property="og:description"]',
+      'meta[name="description"]',
+      "article p",
+      "main p",
+    ],
+  },
+];
 
 function createFeedId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -377,6 +418,50 @@ function stripHtml(raw: string): string {
   return normalizePlainText(text);
 }
 
+function getHostnameFromUrl(raw: string): string {
+  try {
+    return new URL(raw).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function readDescriptionBySelectors(doc: Document, selectors: string[]): string {
+  for (const selector of selectors) {
+    const elements = Array.from(doc.querySelectorAll(selector));
+    for (const element of elements) {
+      const value = normalizePlainText(
+        (element.getAttribute("content") || element.textContent || "").trim(),
+      );
+      if (value.length >= 20) {
+        return value;
+      }
+    }
+  }
+
+  return "";
+}
+
+function readSiteSpecificDescription(url: string, doc: Document): string {
+  const host = getHostnameFromUrl(url);
+  if (!host) {
+    return "";
+  }
+
+  for (const rule of SITE_SPECIFIC_DESCRIPTION_RULES) {
+    if (!rule.hosts.some((pattern) => pattern.test(host))) {
+      continue;
+    }
+
+    const extracted = readDescriptionBySelectors(doc, rule.selectors);
+    if (extracted) {
+      return extracted;
+    }
+  }
+
+  return "";
+}
+
 function readMetaDescription(doc: Document): string {
   const selectors = [
     'meta[property="og:description"]',
@@ -395,17 +480,105 @@ function readMetaDescription(doc: Document): string {
   return "";
 }
 
-function readBestParagraph(doc: Document): string {
-  const paragraphs = Array.from(doc.querySelectorAll("article p, main p, p"))
-    .map((element) => normalizePlainText(element.textContent || ""))
+function collectJsonLdTextCandidates(node: unknown, out: string[]): void {
+  if (node === null || node === undefined) {
+    return;
+  }
+
+  if (typeof node === "string") {
+    const normalized = normalizePlainText(node);
+    if (normalized.length >= 20) {
+      out.push(normalized);
+    }
+    return;
+  }
+
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      collectJsonLdTextCandidates(item, out);
+    }
+    return;
+  }
+
+  if (typeof node !== "object") {
+    return;
+  }
+
+  const obj = node as Record<string, unknown>;
+  for (const [key, value] of Object.entries(obj)) {
+    const lowerKey = key.toLowerCase();
+    if (
+      lowerKey === "description"
+      || lowerKey === "articlebody"
+      || lowerKey === "headline"
+      || lowerKey === "abstract"
+      || lowerKey === "summary"
+    ) {
+      collectJsonLdTextCandidates(value, out);
+      continue;
+    }
+
+    if (typeof value === "object" || Array.isArray(value)) {
+      collectJsonLdTextCandidates(value, out);
+    }
+  }
+}
+
+function readJsonLdDescription(doc: Document): string {
+  const scripts = Array.from(
+    doc.querySelectorAll('script[type="application/ld+json"]'),
+  );
+  const candidates: string[] = [];
+
+  for (const script of scripts) {
+    const raw = (script.textContent || "").trim();
+    if (!raw) {
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      collectJsonLdTextCandidates(parsed, candidates);
+    } catch {
+      continue;
+    }
+  }
+
+  const filtered = candidates
+    .map((text) => normalizePlainText(text))
     .filter((text) => text.length >= 40);
 
-  if (paragraphs.length === 0) {
+  if (filtered.length === 0) {
     return "";
   }
 
-  paragraphs.sort((a, b) => b.length - a.length);
-  return paragraphs[0];
+  filtered.sort((a, b) => b.length - a.length);
+  return filtered[0];
+}
+
+function readBestParagraph(doc: Document): string {
+  const selectorPriority = [
+    ".article-body p",
+    ".article_txt p",
+    "#article_txt p",
+    "article p",
+    "main p",
+    "p",
+  ];
+
+  for (const selector of selectorPriority) {
+    const paragraphs = Array.from(doc.querySelectorAll(selector))
+      .map((element) => normalizePlainText(element.textContent || ""))
+      .filter((text) => text.length >= 40);
+
+    if (paragraphs.length === 0) {
+      continue;
+    }
+
+    return paragraphs.slice(0, 2).join("\n\n");
+  }
+
+  return "";
 }
 
 function truncateText(raw: string, maxLength: number): string {
@@ -1040,9 +1213,19 @@ export default class RssWindowCapturePlugin extends Plugin {
     const parser = new DOMParser();
     const doc = parser.parseFromString(response.text, "text/html");
 
+    const siteSpecific = readSiteSpecificDescription(url, doc);
+    if (siteSpecific) {
+      return siteSpecific;
+    }
+
     const metaDescription = readMetaDescription(doc);
     if (metaDescription) {
       return metaDescription;
+    }
+
+    const jsonLdDescription = readJsonLdDescription(doc);
+    if (jsonLdDescription) {
+      return jsonLdDescription;
     }
 
     const paragraph = readBestParagraph(doc);
