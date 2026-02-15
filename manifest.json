@@ -1,7 +1,7 @@
 {
   "id": "rss-insight",
   "name": "RSS Insight",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "minAppVersion": "1.5.0",
   "description": "Collect RSS/Atom items by schedule windows and save organized notes.",
   "author": "piman",

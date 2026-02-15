@@ -14,6 +14,9 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 - RSS + Atom 파싱
 - 수집 결과를 Vault 폴더에 Markdown 노트로 생성/갱신
 - 자동 실행(Obsidian 실행 중 분 단위 체크) + 수동 명령 실행
+- 키워드 포함/제외 필터
+- 피드 간 중복 제거 강화(링크/제목 정규화)
+- 기사별 4요소 점수 템플릿 자동 삽입
 
 ## Important Limitation
 
@@ -29,6 +32,13 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 - `Include description`: description/summary 포함 여부
 - `Description max length`: description 최대 길이
 - `Write empty notes`: 결과가 없어도 빈 리포트 생성 여부
+- `Enhanced dedupe`: 피드 간 중복 제거 강화
+- `Keyword filter`: 포함/제외 키워드 필터
+- `Include keywords`: 포함 키워드(쉼표/줄바꿈)
+- `Exclude keywords`: 제외 키워드(쉼표/줄바꿈)
+- `Score template`: 점수 템플릿 삽입 여부
+- `Default score value`: 점수 기본값(1-5)
+- `Action threshold`: 액션 후보 기준 점수
 - `Enable RSS Dashboard sync`: RSS Dashboard에 추가한 피드를 자동 동기화
 - `RSS Dashboard data path`: 기본값 `.obsidian/plugins/rss-dashboard/data.json`
 - `Feeds`: topic/name/url/enabled 관리

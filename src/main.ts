@@ -39,6 +39,8 @@ interface CaptureOutcome {
   feedErrors: string[];
   feedsChecked: number;
   itemsWithoutDate: number;
+  itemsFilteredByKeyword: number;
+  itemsDeduped: number;
 }
 
 interface RssDashboardFeedRecord {
@@ -64,6 +66,13 @@ interface RssWindowCaptureSettings {
   rssDashboardDataPath: string;
   rssDashboardLastSyncAtIso: string;
   rssDashboardLastMtime: number;
+  keywordFilterEnabled: boolean;
+  includeKeywords: string;
+  excludeKeywords: string;
+  enhancedDedupeEnabled: boolean;
+  scoreTemplateEnabled: boolean;
+  scoreDefaultValue: number;
+  scoreActionThreshold: number;
   feeds: FeedSource[];
 }
 
@@ -80,11 +89,36 @@ const DEFAULT_SETTINGS: RssWindowCaptureSettings = {
   rssDashboardDataPath: ".obsidian/plugins/rss-dashboard/data.json",
   rssDashboardLastSyncAtIso: "",
   rssDashboardLastMtime: 0,
+  keywordFilterEnabled: false,
+  includeKeywords: "",
+  excludeKeywords: "",
+  enhancedDedupeEnabled: true,
+  scoreTemplateEnabled: true,
+  scoreDefaultValue: 3,
+  scoreActionThreshold: 14,
   feeds: [],
 };
 
 const SCHEDULER_TICK_MS = 60 * 1000;
 const MAX_CATCHUP_WINDOWS = 10;
+const TRACKING_QUERY_KEYS = new Set([
+  "utm_source",
+  "utm_medium",
+  "utm_campaign",
+  "utm_term",
+  "utm_content",
+  "utm_id",
+  "gclid",
+  "fbclid",
+  "igshid",
+  "mc_cid",
+  "mc_eid",
+  "mkt_tok",
+  "ref",
+  "ref_src",
+  "s",
+  "spm",
+]);
 
 function createFeedId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -105,6 +139,78 @@ function normalizeTopic(raw: string): string {
     return "Uncategorized";
   }
   return cleaned;
+}
+
+function normalizeKeywordHaystack(raw: string): string {
+  return raw.toLowerCase();
+}
+
+function parseKeywordList(raw: string): string[] {
+  const out = new Set<string>();
+  for (const token of raw.split(/[\n,]/)) {
+    const trimmed = token.trim().toLowerCase();
+    if (trimmed) {
+      out.add(trimmed);
+    }
+  }
+  return Array.from(out.values());
+}
+
+function matchesKeywordFilter(
+  haystack: string,
+  includeKeywords: string[],
+  excludeKeywords: string[],
+): boolean {
+  if (excludeKeywords.some((keyword) => haystack.includes(keyword))) {
+    return false;
+  }
+  if (includeKeywords.length === 0) {
+    return true;
+  }
+  return includeKeywords.some((keyword) => haystack.includes(keyword));
+}
+
+function formatYmd(date: Date | null): string {
+  if (!date) {
+    return "";
+  }
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
+function normalizeTitleForDedupe(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .trim();
+}
+
+function canonicalizeLinkForDedupe(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    parsed.hash = "";
+
+    const keepPairs: Array<[string, string]> = [];
+    for (const [key, value] of parsed.searchParams.entries()) {
+      if (!TRACKING_QUERY_KEYS.has(key.toLowerCase())) {
+        keepPairs.push([key, value]);
+      }
+    }
+
+    parsed.search = "";
+    for (const [key, value] of keepPairs) {
+      parsed.searchParams.append(key, value);
+    }
+
+    return parsed.toString();
+  } catch {
+    return trimmed.split("#")[0];
+  }
 }
 
 function pad2(value: number): string {
@@ -319,6 +425,16 @@ export default class RssWindowCapturePlugin extends Plugin {
     this.settings.rssDashboardDataPath =
       (this.settings.rssDashboardDataPath || DEFAULT_SETTINGS.rssDashboardDataPath).trim()
       || DEFAULT_SETTINGS.rssDashboardDataPath;
+    this.settings.includeKeywords = (this.settings.includeKeywords || "").trim();
+    this.settings.excludeKeywords = (this.settings.excludeKeywords || "").trim();
+    this.settings.scoreDefaultValue = Math.max(
+      1,
+      Math.min(5, Math.floor(Number(this.settings.scoreDefaultValue) || 3)),
+    );
+    this.settings.scoreActionThreshold = Math.max(
+      1,
+      Math.floor(Number(this.settings.scoreActionThreshold) || 14),
+    );
   }
 
   async saveSettings(): Promise<void> {
@@ -417,6 +533,25 @@ export default class RssWindowCapturePlugin extends Plugin {
       }
       return false;
     }
+  }
+
+  private buildDedupeKeys(feed: FeedSource, item: ParsedFeedItem): string[] {
+    const keys: string[] = [toItemKey(feed, item)];
+    if (!this.settings.enhancedDedupeEnabled) {
+      return keys;
+    }
+
+    const canonicalLink = canonicalizeLinkForDedupe(item.link);
+    if (canonicalLink) {
+      keys.push(`link::${canonicalLink}`);
+    }
+
+    const normalizedTitle = normalizeTitleForDedupe(item.title);
+    if (normalizedTitle) {
+      keys.push(`title::${normalizedTitle}::${formatYmd(item.published)}`);
+    }
+
+    return keys;
   }
 
   async runDueWindows(reason: "manual" | "scheduler" | "startup" | "settings"): Promise<void> {
@@ -632,6 +767,10 @@ export default class RssWindowCapturePlugin extends Plugin {
     const feedErrors: string[] = [];
     let totalItems = 0;
     let itemsWithoutDate = 0;
+    let itemsFilteredByKeyword = 0;
+    let itemsDeduped = 0;
+    const includeKeywords = parseKeywordList(this.settings.includeKeywords);
+    const excludeKeywords = parseKeywordList(this.settings.excludeKeywords);
 
     const fetchResults = await Promise.allSettled(
       feeds.map(async (feed) => ({
@@ -661,11 +800,22 @@ export default class RssWindowCapturePlugin extends Plugin {
           continue;
         }
 
-        const itemKey = toItemKey(feed, item);
-        if (itemKeys.has(itemKey)) {
+        if (this.settings.keywordFilterEnabled) {
+          const haystack = normalizeKeywordHaystack(
+            `${item.title}\n${item.description}\n${item.link}\n${feed.name}\n${feed.topic}`,
+          );
+          if (!matchesKeywordFilter(haystack, includeKeywords, excludeKeywords)) {
+            itemsFilteredByKeyword += 1;
+            continue;
+          }
+        }
+
+        const dedupeKeys = this.buildDedupeKeys(feed, item);
+        if (dedupeKeys.some((key) => itemKeys.has(key))) {
+          itemsDeduped += 1;
           continue;
         }
-        itemKeys.add(itemKey);
+        dedupeKeys.forEach((key) => itemKeys.add(key));
 
         const topic = feed.topic.trim() || "Uncategorized";
         if (!grouped.has(topic)) {
@@ -683,6 +833,8 @@ export default class RssWindowCapturePlugin extends Plugin {
         feedErrors,
         feedsChecked: feeds.length,
         itemsWithoutDate,
+        itemsFilteredByKeyword,
+        itemsDeduped,
       };
     }
 
@@ -694,6 +846,8 @@ export default class RssWindowCapturePlugin extends Plugin {
       feeds.length,
       totalItems,
       itemsWithoutDate,
+      itemsFilteredByKeyword,
+      itemsDeduped,
       feedErrors,
     );
 
@@ -706,6 +860,8 @@ export default class RssWindowCapturePlugin extends Plugin {
       feedErrors,
       feedsChecked: feeds.length,
       itemsWithoutDate,
+      itemsFilteredByKeyword,
+      itemsDeduped,
     };
   }
 
@@ -727,9 +883,13 @@ export default class RssWindowCapturePlugin extends Plugin {
     feedsChecked: number,
     totalItems: number,
     itemsWithoutDate: number,
+    itemsFilteredByKeyword: number,
+    itemsDeduped: number,
     feedErrors: string[],
   ): string {
     const lines: string[] = [];
+    const defaultScore = this.settings.scoreDefaultValue;
+    const defaultTotalScore = defaultScore * 4;
 
     lines.push("---");
     lines.push('plugin: "rss-insight"');
@@ -739,7 +899,10 @@ export default class RssWindowCapturePlugin extends Plugin {
     lines.push(`feeds_checked: ${feedsChecked}`);
     lines.push(`items_count: ${totalItems}`);
     lines.push(`items_without_date: ${itemsWithoutDate}`);
+    lines.push(`items_filtered_by_keyword: ${itemsFilteredByKeyword}`);
+    lines.push(`items_deduped: ${itemsDeduped}`);
     lines.push(`feed_errors: ${feedErrors.length}`);
+    lines.push(`score_template_enabled: ${this.settings.scoreTemplateEnabled ? "true" : "false"}`);
     lines.push("---");
     lines.push("");
 
@@ -749,6 +912,8 @@ export default class RssWindowCapturePlugin extends Plugin {
     lines.push(`- Window end: ${formatLocalDateTime(windowEnd)}`);
     lines.push(`- Feeds checked: ${feedsChecked}`);
     lines.push(`- Items captured: ${totalItems}`);
+    lines.push(`- Filtered by keywords: ${itemsFilteredByKeyword}`);
+    lines.push(`- Deduped: ${itemsDeduped}`);
     lines.push("");
 
     const topics = Array.from(grouped.keys()).sort((a, b) => a.localeCompare(b));
@@ -783,6 +948,13 @@ export default class RssWindowCapturePlugin extends Plugin {
         lines.push(`- Published: ${published}`);
         if (link) {
           lines.push(`- URL: ${link}`);
+        }
+
+        if (this.settings.scoreTemplateEnabled) {
+          lines.push(
+            `- Score: Impact ${defaultScore} / Actionability ${defaultScore} / Timing ${defaultScore} / Confidence ${defaultScore} = ${defaultTotalScore}`,
+          );
+          lines.push(`- Action candidate threshold: ${this.settings.scoreActionThreshold}+`);
         }
 
         if (this.settings.includeDescription && row.item.description) {
@@ -1028,6 +1200,94 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
           this.plugin.settings.writeEmptyNote = value;
           await this.plugin.saveSettings();
         }),
+      );
+
+    containerEl.createEl("h3", { text: "Filtering, Dedupe, Scoring" });
+
+    new Setting(containerEl)
+      .setName("Enhanced dedupe")
+      .setDesc("Deduplicate across feeds using normalized link/title.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.enhancedDedupeEnabled).onChange(async (value) => {
+          this.plugin.settings.enhancedDedupeEnabled = value;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Keyword filter")
+      .setDesc("Apply include/exclude keyword filter to collected items.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.keywordFilterEnabled).onChange(async (value) => {
+          this.plugin.settings.keywordFilterEnabled = value;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Include keywords")
+      .setDesc("Comma or newline separated. Match any keyword.")
+      .addTextArea((text) =>
+        text.setPlaceholder("ai, bitcoin, fed")
+          .setValue(this.plugin.settings.includeKeywords)
+          .onChange(async (value) => {
+            this.plugin.settings.includeKeywords = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Exclude keywords")
+      .setDesc("Comma or newline separated. Exclude if matched.")
+      .addTextArea((text) =>
+        text.setPlaceholder("sponsored, advertisement")
+          .setValue(this.plugin.settings.excludeKeywords)
+          .onChange(async (value) => {
+            this.plugin.settings.excludeKeywords = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Score template")
+      .setDesc("Add default 4-factor score lines under each item.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.scoreTemplateEnabled).onChange(async (value) => {
+          this.plugin.settings.scoreTemplateEnabled = value;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Default score value")
+      .setDesc("Default value for Impact/Actionability/Timing/Confidence (1-5).")
+      .addText((text) =>
+        text
+          .setPlaceholder("3")
+          .setValue(String(this.plugin.settings.scoreDefaultValue))
+          .onChange(async (value) => {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 5) {
+              this.plugin.settings.scoreDefaultValue = Math.floor(parsed);
+              await this.plugin.saveSettings();
+            }
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Action threshold")
+      .setDesc("Score total threshold reference for action candidates.")
+      .addText((text) =>
+        text
+          .setPlaceholder("14")
+          .setValue(String(this.plugin.settings.scoreActionThreshold))
+          .onChange(async (value) => {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed) && parsed > 0) {
+              this.plugin.settings.scoreActionThreshold = Math.floor(parsed);
+              await this.plugin.saveSettings();
+            }
+          }),
       );
 
     new Setting(containerEl)
