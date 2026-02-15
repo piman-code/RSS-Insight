@@ -20,6 +20,8 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 - 기사별 4요소 점수 템플릿 자동 삽입
 - 영어 등 비한글 항목 자동 번역(웹 번역 또는 로컬 Ollama 선택)
 - Ollama 모델 자동 탐지 + 추천 + 드롭다운 선택
+- 번역 description은 300자 미리보기로 저장, 원문 description은 접힘(details)으로 보관
+- feed description이 비어있으면 기사 링크에서 meta/본문 문단을 보강 추출 시도
 
 ## Important Limitation
 

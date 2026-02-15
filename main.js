@@ -62,6 +62,8 @@ var DEFAULT_SETTINGS = {
 };
 var SCHEDULER_TICK_MS = 60 * 1e3;
 var MAX_TRANSLATION_INPUT_LENGTH = 2e3;
+var TRANSLATED_DESCRIPTION_MAX_LENGTH = 300;
+var MAX_DESCRIPTION_ENRICH_ITEMS_PER_WINDOW = 40;
 var TRACKING_QUERY_KEYS = /* @__PURE__ */ new Set([
   "utm_source",
   "utm_medium",
@@ -253,6 +255,29 @@ function stripHtml(raw) {
   const doc = parser.parseFromString(raw, "text/html");
   const text = (_d = (_c = (_a = doc.body) == null ? void 0 : _a.textContent) != null ? _c : (_b = doc.documentElement) == null ? void 0 : _b.textContent) != null ? _d : "";
   return normalizePlainText(text);
+}
+function readMetaDescription(doc) {
+  const selectors = [
+    'meta[property="og:description"]',
+    'meta[name="twitter:description"]',
+    'meta[name="description"]'
+  ];
+  for (const selector of selectors) {
+    const element = doc.querySelector(selector);
+    const content = ((element == null ? void 0 : element.getAttribute("content")) || "").trim();
+    if (content) {
+      return normalizePlainText(content);
+    }
+  }
+  return "";
+}
+function readBestParagraph(doc) {
+  const paragraphs = Array.from(doc.querySelectorAll("article p, main p, p")).map((element) => normalizePlainText(element.textContent || "")).filter((text) => text.length >= 40);
+  if (paragraphs.length === 0) {
+    return "";
+  }
+  paragraphs.sort((a, b) => b.length - a.length);
+  return paragraphs[0];
 }
 function truncateText(raw, maxLength) {
   if (raw.length <= maxLength) {
@@ -726,6 +751,49 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
     }
     return String(error);
   }
+  async enrichMissingDescriptions(grouped) {
+    if (!this.settings.includeDescription) {
+      return;
+    }
+    const candidates = Array.from(grouped.values()).flat().filter((row) => !normalizePlainText(row.item.description) && row.item.link.trim().length > 0).slice(0, MAX_DESCRIPTION_ENRICH_ITEMS_PER_WINDOW);
+    if (candidates.length === 0) {
+      return;
+    }
+    const results = await Promise.allSettled(
+      candidates.map(async (row) => {
+        const description = await this.fetchDescriptionFromArticleLink(row.item.link);
+        if (description) {
+          row.item.description = description;
+        }
+      })
+    );
+    for (const result of results) {
+      if (result.status === "rejected") {
+        console.debug("[rss-insight] description enrich skipped", result.reason);
+      }
+    }
+  }
+  async fetchDescriptionFromArticleLink(url) {
+    const response = await (0, import_obsidian.requestUrl)({
+      url,
+      method: "GET",
+      throw: false,
+      headers: {
+        Accept: "text/html,application/xhtml+xml"
+      }
+    });
+    if (response.status >= 400 || !response.text) {
+      return "";
+    }
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(response.text, "text/html");
+    const metaDescription = readMetaDescription(doc);
+    if (metaDescription) {
+      return metaDescription;
+    }
+    const paragraph = readBestParagraph(doc);
+    return paragraph;
+  }
   buildDedupeKeys(feed, item) {
     const keys = [toItemKey(feed, item)];
     if (!this.settings.enhancedDedupeEnabled) {
@@ -977,6 +1045,7 @@ ${feed.topic}`
         itemsDeduped
       };
     }
+    await this.enrichMissingDescriptions(grouped);
     const translationStats = await this.applyTranslations(grouped);
     const notePath = this.buildOutputPath(windowEnd);
     const content = this.buildNoteContent(
@@ -1087,28 +1156,26 @@ ${feed.topic}`
           lines.push(`- Action candidate threshold: ${this.settings.scoreActionThreshold}+`);
         }
         if (this.settings.includeDescription && row.item.description) {
+          const hasTranslatedDescription = !!row.translatedDescription && normalizePlainText(row.translatedDescription) !== normalizePlainText(row.item.description);
+          const maxLength = hasTranslatedDescription ? TRANSLATED_DESCRIPTION_MAX_LENGTH : Math.max(80, this.settings.descriptionMaxLength);
           const descriptionBody = row.translatedDescription || row.item.description;
-          const description = truncateText(
-            normalizePlainText(descriptionBody),
-            Math.max(80, this.settings.descriptionMaxLength)
-          );
+          const description = truncateText(normalizePlainText(descriptionBody), maxLength);
           if (description) {
             lines.push("");
             for (const descLine of description.split("\n")) {
               lines.push(`> ${descLine}`);
             }
           }
-          if (row.translatedDescription && this.settings.translationKeepOriginal && row.translatedDescription !== row.item.description) {
-            const originalDescription = truncateText(
-              normalizePlainText(row.item.description),
-              Math.max(80, this.settings.descriptionMaxLength)
-            );
+          if (hasTranslatedDescription && this.settings.translationKeepOriginal) {
+            const originalDescription = normalizePlainText(row.item.description);
             if (originalDescription) {
               lines.push("");
-              lines.push("> [Original]");
-              for (const descLine of originalDescription.split("\n")) {
-                lines.push(`> ${descLine}`);
-              }
+              lines.push("<details>");
+              lines.push("<summary>Original description</summary>");
+              lines.push("");
+              lines.push(originalDescription);
+              lines.push("");
+              lines.push("</details>");
             }
           }
         }

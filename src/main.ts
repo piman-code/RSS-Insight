@@ -141,6 +141,8 @@ const DEFAULT_SETTINGS: RssWindowCaptureSettings = {
 
 const SCHEDULER_TICK_MS = 60 * 1000;
 const MAX_TRANSLATION_INPUT_LENGTH = 2000;
+const TRANSLATED_DESCRIPTION_MAX_LENGTH = 300;
+const MAX_DESCRIPTION_ENRICH_ITEMS_PER_WINDOW = 40;
 const TRACKING_QUERY_KEYS = new Set([
   "utm_source",
   "utm_medium",
@@ -373,6 +375,37 @@ function stripHtml(raw: string): string {
   const doc = parser.parseFromString(raw, "text/html");
   const text = doc.body?.textContent ?? doc.documentElement?.textContent ?? "";
   return normalizePlainText(text);
+}
+
+function readMetaDescription(doc: Document): string {
+  const selectors = [
+    'meta[property="og:description"]',
+    'meta[name="twitter:description"]',
+    'meta[name="description"]',
+  ];
+
+  for (const selector of selectors) {
+    const element = doc.querySelector(selector);
+    const content = (element?.getAttribute("content") || "").trim();
+    if (content) {
+      return normalizePlainText(content);
+    }
+  }
+
+  return "";
+}
+
+function readBestParagraph(doc: Document): string {
+  const paragraphs = Array.from(doc.querySelectorAll("article p, main p, p"))
+    .map((element) => normalizePlainText(element.textContent || ""))
+    .filter((text) => text.length >= 40);
+
+  if (paragraphs.length === 0) {
+    return "";
+  }
+
+  paragraphs.sort((a, b) => b.length - a.length);
+  return paragraphs[0];
 }
 
 function truncateText(raw: string, maxLength: number): string {
@@ -960,6 +993,62 @@ export default class RssWindowCapturePlugin extends Plugin {
     return String(error);
   }
 
+  private async enrichMissingDescriptions(grouped: Map<string, WindowItem[]>): Promise<void> {
+    if (!this.settings.includeDescription) {
+      return;
+    }
+
+    const candidates = Array.from(grouped.values())
+      .flat()
+      .filter((row) => !normalizePlainText(row.item.description) && row.item.link.trim().length > 0)
+      .slice(0, MAX_DESCRIPTION_ENRICH_ITEMS_PER_WINDOW);
+
+    if (candidates.length === 0) {
+      return;
+    }
+
+    const results = await Promise.allSettled(
+      candidates.map(async (row) => {
+        const description = await this.fetchDescriptionFromArticleLink(row.item.link);
+        if (description) {
+          row.item.description = description;
+        }
+      }),
+    );
+
+    for (const result of results) {
+      if (result.status === "rejected") {
+        console.debug("[rss-insight] description enrich skipped", result.reason);
+      }
+    }
+  }
+
+  private async fetchDescriptionFromArticleLink(url: string): Promise<string> {
+    const response = await requestUrl({
+      url,
+      method: "GET",
+      throw: false,
+      headers: {
+        Accept: "text/html,application/xhtml+xml",
+      },
+    });
+
+    if (response.status >= 400 || !response.text) {
+      return "";
+    }
+
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(response.text, "text/html");
+
+    const metaDescription = readMetaDescription(doc);
+    if (metaDescription) {
+      return metaDescription;
+    }
+
+    const paragraph = readBestParagraph(doc);
+    return paragraph;
+  }
+
   private buildDedupeKeys(feed: FeedSource, item: ParsedFeedItem): string[] {
     const keys: string[] = [toItemKey(feed, item)];
     if (!this.settings.enhancedDedupeEnabled) {
@@ -1264,6 +1353,7 @@ export default class RssWindowCapturePlugin extends Plugin {
       };
     }
 
+    await this.enrichMissingDescriptions(grouped);
     const translationStats = await this.applyTranslations(grouped);
 
     const notePath = this.buildOutputPath(windowEnd);
@@ -1402,11 +1492,14 @@ export default class RssWindowCapturePlugin extends Plugin {
         }
 
         if (this.settings.includeDescription && row.item.description) {
+          const hasTranslatedDescription =
+            !!row.translatedDescription
+            && normalizePlainText(row.translatedDescription) !== normalizePlainText(row.item.description);
+          const maxLength = hasTranslatedDescription
+            ? TRANSLATED_DESCRIPTION_MAX_LENGTH
+            : Math.max(80, this.settings.descriptionMaxLength);
           const descriptionBody = row.translatedDescription || row.item.description;
-          const description = truncateText(
-            normalizePlainText(descriptionBody),
-            Math.max(80, this.settings.descriptionMaxLength),
-          );
+          const description = truncateText(normalizePlainText(descriptionBody), maxLength);
           if (description) {
             lines.push("");
             for (const descLine of description.split("\n")) {
@@ -1415,20 +1508,18 @@ export default class RssWindowCapturePlugin extends Plugin {
           }
 
           if (
-            row.translatedDescription
+            hasTranslatedDescription
             && this.settings.translationKeepOriginal
-            && row.translatedDescription !== row.item.description
           ) {
-            const originalDescription = truncateText(
-              normalizePlainText(row.item.description),
-              Math.max(80, this.settings.descriptionMaxLength),
-            );
+            const originalDescription = normalizePlainText(row.item.description);
             if (originalDescription) {
               lines.push("");
-              lines.push("> [Original]");
-              for (const descLine of originalDescription.split("\n")) {
-                lines.push(`> ${descLine}`);
-              }
+              lines.push("<details>");
+              lines.push("<summary>Original description</summary>");
+              lines.push("");
+              lines.push(originalDescription);
+              lines.push("");
+              lines.push("</details>");
             }
           }
         }
