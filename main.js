@@ -44,10 +44,24 @@ var DEFAULT_SETTINGS = {
   scoreTemplateEnabled: true,
   scoreDefaultValue: 3,
   scoreActionThreshold: 14,
+  startupCatchupEnabled: true,
+  maxCatchupWindowsPerRun: 10,
+  translationEnabled: false,
+  translationProvider: "web",
+  translationTargetLanguage: "ko",
+  translationOnlyNonKorean: true,
+  translationKeepOriginal: true,
+  translationTranslateTitle: true,
+  translationTranslateDescription: true,
+  translationWebEndpoint: "https://translate.googleapis.com/translate_a/single",
+  ollamaBaseUrl: "http://127.0.0.1:11434",
+  ollamaDetectedModels: [],
+  ollamaModel: "",
+  ollamaLastModelRefreshIso: "",
   feeds: []
 };
 var SCHEDULER_TICK_MS = 60 * 1e3;
-var MAX_CATCHUP_WINDOWS = 10;
+var MAX_TRANSLATION_INPUT_LENGTH = 2e3;
 var TRACKING_QUERY_KEYS = /* @__PURE__ */ new Set([
   "utm_source",
   "utm_medium",
@@ -66,6 +80,15 @@ var TRACKING_QUERY_KEYS = /* @__PURE__ */ new Set([
   "s",
   "spm"
 ]);
+var OLLAMA_MODEL_RECOMMENDATION_PATTERNS = [
+  /qwen2\.5/i,
+  /qwen3/i,
+  /llama3(\.1)?/i,
+  /exaone/i,
+  /gemma/i,
+  /mistral/i,
+  /phi/i
+];
 function createFeedId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -105,6 +128,21 @@ function matchesKeywordFilter(haystack, includeKeywords, excludeKeywords) {
     return true;
   }
   return includeKeywords.some((keyword) => haystack.includes(keyword));
+}
+function containsHangul(raw) {
+  return /[가-힣]/.test(raw);
+}
+function hasAnyLetters(raw) {
+  return /\p{L}/u.test(raw);
+}
+function normalizeHttpBaseUrl(raw) {
+  return raw.trim().replace(/\/+$/, "");
+}
+function truncateForModelInput(raw) {
+  if (raw.length <= MAX_TRANSLATION_INPUT_LENGTH) {
+    return raw;
+  }
+  return `${raw.slice(0, MAX_TRANSLATION_INPUT_LENGTH).trimEnd()}...`;
 }
 function formatYmd(date) {
   if (!date) {
@@ -259,6 +297,7 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
     this.runInProgress = false;
+    this.translationCache = /* @__PURE__ */ new Map();
   }
   async onload() {
     await this.loadSettings();
@@ -284,6 +323,13 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
         void this.syncFeedsFromRssDashboard(true, true);
       }
     });
+    this.addCommand({
+      id: "refresh-ollama-models",
+      name: "Refresh Ollama translation models",
+      callback: () => {
+        void this.refreshOllamaModels(true);
+      }
+    });
     this.addRibbonIcon("rss", "Run due RSS window captures now", () => {
       void this.runDueWindows("manual");
     });
@@ -299,7 +345,7 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
       if (this.settings.rssDashboardSyncEnabled) {
         void this.syncFeedsFromRssDashboard(false, false);
       }
-      if (!this.settings.autoFetchEnabled) {
+      if (!this.settings.autoFetchEnabled || !this.settings.startupCatchupEnabled) {
         return;
       }
       void this.runDueWindows("startup");
@@ -328,6 +374,20 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
       1,
       Math.floor(Number(this.settings.scoreActionThreshold) || 14)
     );
+    this.settings.maxCatchupWindowsPerRun = Math.max(
+      1,
+      Math.min(100, Math.floor(Number(this.settings.maxCatchupWindowsPerRun) || 10))
+    );
+    this.settings.translationProvider = this.normalizeTranslationProvider(
+      this.settings.translationProvider
+    );
+    this.settings.translationTargetLanguage = (this.settings.translationTargetLanguage || "ko").trim().toLowerCase() || "ko";
+    this.settings.translationWebEndpoint = normalizeHttpBaseUrl(
+      this.settings.translationWebEndpoint || DEFAULT_SETTINGS.translationWebEndpoint
+    ) || DEFAULT_SETTINGS.translationWebEndpoint;
+    this.settings.ollamaBaseUrl = normalizeHttpBaseUrl(this.settings.ollamaBaseUrl || DEFAULT_SETTINGS.ollamaBaseUrl) || DEFAULT_SETTINGS.ollamaBaseUrl;
+    this.settings.ollamaDetectedModels = Array.isArray(this.settings.ollamaDetectedModels) ? this.settings.ollamaDetectedModels.filter((model) => typeof model === "string").map((model) => model.trim()).filter((model) => model.length > 0) : [];
+    this.settings.ollamaModel = (this.settings.ollamaModel || "").trim();
   }
   async saveSettings() {
     await this.saveData(this.settings);
@@ -408,6 +468,263 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
       }
       return false;
     }
+  }
+  getOllamaModelOptionsForUi() {
+    const out = [];
+    const seen = /* @__PURE__ */ new Set();
+    const current = this.settings.ollamaModel.trim();
+    if (current) {
+      out.push(current);
+      seen.add(current);
+    }
+    for (const model of this.settings.ollamaDetectedModels) {
+      const trimmed = model.trim();
+      if (!trimmed || seen.has(trimmed)) {
+        continue;
+      }
+      out.push(trimmed);
+      seen.add(trimmed);
+    }
+    return out;
+  }
+  getRecommendedOllamaModelForUi() {
+    const options = this.getOllamaModelOptionsForUi();
+    return this.getRecommendedOllamaModel(options);
+  }
+  async refreshOllamaModels(showNotice) {
+    const base = normalizeHttpBaseUrl(this.settings.ollamaBaseUrl || DEFAULT_SETTINGS.ollamaBaseUrl);
+    if (!base) {
+      if (showNotice) {
+        new import_obsidian.Notice("Ollama base URL is empty.");
+      }
+      return [];
+    }
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${base}/api/tags`,
+        method: "GET",
+        throw: false,
+        headers: {
+          Accept: "application/json"
+        }
+      });
+      if (response.status >= 400) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const parsed = JSON.parse(response.text);
+      const models = Array.isArray(parsed.models) ? parsed.models.map((model) => typeof (model == null ? void 0 : model.name) === "string" ? model.name.trim() : "").filter((name) => name.length > 0) : [];
+      this.settings.ollamaDetectedModels = Array.from(new Set(models));
+      this.settings.ollamaLastModelRefreshIso = (/* @__PURE__ */ new Date()).toISOString();
+      if (this.settings.ollamaDetectedModels.length > 0 && !this.settings.ollamaDetectedModels.includes(this.settings.ollamaModel)) {
+        this.settings.ollamaModel = this.getRecommendedOllamaModel(
+          this.settings.ollamaDetectedModels
+        );
+      }
+      await this.saveSettings();
+      if (showNotice) {
+        const recommended = this.getRecommendedOllamaModel(this.settings.ollamaDetectedModels);
+        const suffix = recommended ? ` / recommended: ${recommended}` : "";
+        new import_obsidian.Notice(`Detected ${this.settings.ollamaDetectedModels.length} Ollama model(s)${suffix}.`, 6e3);
+      }
+      return this.settings.ollamaDetectedModels;
+    } catch (error) {
+      console.error("[rss-insight] ollama model refresh failure", error);
+      if (showNotice) {
+        new import_obsidian.Notice("Failed to fetch Ollama models. Check Ollama server URL.", 8e3);
+      }
+      return [];
+    }
+  }
+  normalizeTranslationProvider(raw) {
+    if (raw === "none" || raw === "web" || raw === "ollama") {
+      return raw;
+    }
+    return DEFAULT_SETTINGS.translationProvider;
+  }
+  getRecommendedOllamaModel(models) {
+    if (models.length === 0) {
+      return "";
+    }
+    for (const pattern of OLLAMA_MODEL_RECOMMENDATION_PATTERNS) {
+      const match = models.find((model) => pattern.test(model));
+      if (match) {
+        return match;
+      }
+    }
+    return models[0];
+  }
+  getEffectiveTranslationProvider() {
+    if (!this.settings.translationEnabled) {
+      return "none";
+    }
+    const provider = this.normalizeTranslationProvider(this.settings.translationProvider);
+    if (provider === "ollama" && !this.settings.ollamaModel.trim()) {
+      return "none";
+    }
+    return provider;
+  }
+  shouldTranslateField(raw) {
+    const text = normalizePlainText(raw);
+    if (!text) {
+      return false;
+    }
+    if (!hasAnyLetters(text)) {
+      return false;
+    }
+    if (!this.settings.translationOnlyNonKorean) {
+      return true;
+    }
+    return !containsHangul(text);
+  }
+  async applyTranslations(grouped) {
+    const provider = this.getEffectiveTranslationProvider();
+    const model = provider === "ollama" ? this.settings.ollamaModel.trim() : "";
+    const stats = {
+      provider,
+      model,
+      titlesTranslated: 0,
+      descriptionsTranslated: 0,
+      errors: []
+    };
+    if (provider === "none") {
+      return stats;
+    }
+    const rows = Array.from(grouped.values()).flat();
+    if (rows.length === 0) {
+      return stats;
+    }
+    for (const row of rows) {
+      if (this.settings.translationTranslateTitle && this.shouldTranslateField(row.item.title)) {
+        try {
+          const translated = await this.translateTextWithProvider(row.item.title, provider, model);
+          if (translated && translated !== row.item.title) {
+            row.translatedTitle = translated;
+            stats.titlesTranslated += 1;
+          }
+        } catch (error) {
+          stats.errors.push(
+            `Title translation failed (${row.feed.name || row.feed.url}): ${this.errorToMessage(error)}`
+          );
+        }
+      }
+      if (this.settings.translationTranslateDescription && this.settings.includeDescription && this.shouldTranslateField(row.item.description)) {
+        try {
+          const translated = await this.translateTextWithProvider(
+            row.item.description,
+            provider,
+            model
+          );
+          if (translated && translated !== row.item.description) {
+            row.translatedDescription = translated;
+            stats.descriptionsTranslated += 1;
+          }
+        } catch (error) {
+          stats.errors.push(
+            `Description translation failed (${row.feed.name || row.feed.url}): ${this.errorToMessage(error)}`
+          );
+        }
+      }
+    }
+    return stats;
+  }
+  async translateTextWithProvider(raw, provider, model) {
+    const normalized = normalizePlainText(raw);
+    if (!normalized) {
+      return normalized;
+    }
+    const targetLanguage = (this.settings.translationTargetLanguage || "ko").trim().toLowerCase();
+    const cacheKey = `${provider}::${model}::${targetLanguage}::${normalized}`;
+    const cached = this.translationCache.get(cacheKey);
+    if (cached !== void 0) {
+      return cached;
+    }
+    let translated = normalized;
+    if (provider === "web") {
+      translated = await this.translateWithWebProvider(normalized, targetLanguage);
+    } else if (provider === "ollama") {
+      translated = await this.translateWithOllamaProvider(normalized, targetLanguage, model);
+    }
+    const out = normalizePlainText(translated) || normalized;
+    this.translationCache.set(cacheKey, out);
+    return out;
+  }
+  async translateWithWebProvider(raw, targetLanguage) {
+    const endpoint = normalizeHttpBaseUrl(
+      this.settings.translationWebEndpoint || DEFAULT_SETTINGS.translationWebEndpoint
+    );
+    const url = `${endpoint}?client=gtx&sl=auto&tl=${encodeURIComponent(targetLanguage)}&dt=t&q=${encodeURIComponent(raw)}`;
+    const response = await (0, import_obsidian.requestUrl)({
+      url,
+      method: "GET",
+      throw: false,
+      headers: {
+        Accept: "application/json, text/plain, */*"
+      }
+    });
+    if (response.status >= 400) {
+      throw new Error(`web translate HTTP ${response.status}`);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(response.text);
+    } catch (e) {
+      throw new Error("web translate invalid JSON");
+    }
+    if (!Array.isArray(parsed) || !Array.isArray(parsed[0])) {
+      throw new Error("web translate unexpected payload");
+    }
+    const translated = parsed[0].map((chunk) => {
+      if (!Array.isArray(chunk) || typeof chunk[0] !== "string") {
+        return "";
+      }
+      return chunk[0];
+    }).join("");
+    return normalizePlainText(translated) || raw;
+  }
+  async translateWithOllamaProvider(raw, targetLanguage, model) {
+    const base = normalizeHttpBaseUrl(this.settings.ollamaBaseUrl || DEFAULT_SETTINGS.ollamaBaseUrl);
+    if (!model) {
+      throw new Error("Ollama model is not selected");
+    }
+    const prompt = [
+      "You are a precise translator.",
+      `Translate the text into ${targetLanguage}.`,
+      "Preserve facts, numbers, names, and URLs.",
+      "Return only the translated text.",
+      "",
+      truncateForModelInput(raw)
+    ].join("\n");
+    const response = await (0, import_obsidian.requestUrl)({
+      url: `${base}/api/generate`,
+      method: "POST",
+      throw: false,
+      contentType: "application/json",
+      body: JSON.stringify({
+        model,
+        prompt,
+        stream: false,
+        options: {
+          temperature: 0.1
+        }
+      }),
+      headers: {
+        Accept: "application/json"
+      }
+    });
+    if (response.status >= 400) {
+      throw new Error(`ollama HTTP ${response.status}`);
+    }
+    const parsed = JSON.parse(response.text);
+    if (typeof parsed.response !== "string") {
+      throw new Error("ollama invalid response payload");
+    }
+    return normalizePlainText(parsed.response) || raw;
+  }
+  errorToMessage(error) {
+    if (error instanceof Error) {
+      return error.message;
+    }
+    return String(error);
   }
   buildDedupeKeys(feed, item) {
     const keys = [toItemKey(feed, item)];
@@ -542,7 +859,8 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
     }
     const due = [];
     let cursor = anchor;
-    for (let i = 0; i < MAX_CATCHUP_WINDOWS; i += 1) {
+    const maxCatchupWindows = Math.max(1, Math.min(100, this.settings.maxCatchupWindowsPerRun));
+    for (let i = 0; i < maxCatchupWindows; i += 1) {
       const next = this.findNextBoundary(cursor, scheduleMinutes);
       if (next.getTime() > now.getTime()) {
         break;
@@ -659,6 +977,7 @@ ${feed.topic}`
         itemsDeduped
       };
     }
+    const translationStats = await this.applyTranslations(grouped);
     const notePath = this.buildOutputPath(windowEnd);
     const content = this.buildNoteContent(
       windowStart,
@@ -669,7 +988,8 @@ ${feed.topic}`
       itemsWithoutDate,
       itemsFilteredByKeyword,
       itemsDeduped,
-      feedErrors
+      feedErrors,
+      translationStats
     );
     await this.ensureFolderExists(this.resolveOutputFolder());
     await this.writeOrOverwriteNote(notePath, content);
@@ -692,7 +1012,7 @@ ${feed.topic}`
   resolveOutputFolder() {
     return (0, import_obsidian.normalizePath)(this.settings.outputFolder.trim() || DEFAULT_SETTINGS.outputFolder);
   }
-  buildNoteContent(windowStart, windowEnd, grouped, feedsChecked, totalItems, itemsWithoutDate, itemsFilteredByKeyword, itemsDeduped, feedErrors) {
+  buildNoteContent(windowStart, windowEnd, grouped, feedsChecked, totalItems, itemsWithoutDate, itemsFilteredByKeyword, itemsDeduped, feedErrors, translationStats) {
     var _a;
     const lines = [];
     const defaultScore = this.settings.scoreDefaultValue;
@@ -708,6 +1028,13 @@ ${feed.topic}`
     lines.push(`items_filtered_by_keyword: ${itemsFilteredByKeyword}`);
     lines.push(`items_deduped: ${itemsDeduped}`);
     lines.push(`feed_errors: ${feedErrors.length}`);
+    lines.push(`translation_provider: "${translationStats.provider}"`);
+    if (translationStats.model) {
+      lines.push(`translation_model: "${escapeYamlString(translationStats.model)}"`);
+    }
+    lines.push(`titles_translated: ${translationStats.titlesTranslated}`);
+    lines.push(`descriptions_translated: ${translationStats.descriptionsTranslated}`);
+    lines.push(`translation_errors: ${translationStats.errors.length}`);
     lines.push(`score_template_enabled: ${this.settings.scoreTemplateEnabled ? "true" : "false"}`);
     lines.push("---");
     lines.push("");
@@ -719,6 +1046,9 @@ ${feed.topic}`
     lines.push(`- Items captured: ${totalItems}`);
     lines.push(`- Filtered by keywords: ${itemsFilteredByKeyword}`);
     lines.push(`- Deduped: ${itemsDeduped}`);
+    lines.push(`- Translation provider: ${translationStats.provider}`);
+    lines.push(`- Titles translated: ${translationStats.titlesTranslated}`);
+    lines.push(`- Descriptions translated: ${translationStats.descriptionsTranslated}`);
     lines.push("");
     const topics = Array.from(grouped.keys()).sort((a, b) => a.localeCompare(b));
     if (topics.length === 0) {
@@ -738,13 +1068,17 @@ ${feed.topic}`
       });
       for (const row of rows) {
         const title = row.item.title || "(untitled)";
+        const displayTitle = row.translatedTitle || title;
         const link = row.item.link || "";
         const published = row.item.published ? formatLocalDateTime(row.item.published) : row.item.publishedRaw || "unknown";
-        lines.push(`### ${title}`);
+        lines.push(`### ${displayTitle}`);
         lines.push(`- Source: ${row.feed.name || row.feed.url}`);
         lines.push(`- Published: ${published}`);
         if (link) {
           lines.push(`- URL: ${link}`);
+        }
+        if (displayTitle !== title) {
+          lines.push(`- Original title: ${title}`);
         }
         if (this.settings.scoreTemplateEnabled) {
           lines.push(
@@ -753,14 +1087,28 @@ ${feed.topic}`
           lines.push(`- Action candidate threshold: ${this.settings.scoreActionThreshold}+`);
         }
         if (this.settings.includeDescription && row.item.description) {
+          const descriptionBody = row.translatedDescription || row.item.description;
           const description = truncateText(
-            normalizePlainText(row.item.description),
+            normalizePlainText(descriptionBody),
             Math.max(80, this.settings.descriptionMaxLength)
           );
           if (description) {
             lines.push("");
             for (const descLine of description.split("\n")) {
               lines.push(`> ${descLine}`);
+            }
+          }
+          if (row.translatedDescription && this.settings.translationKeepOriginal && row.translatedDescription !== row.item.description) {
+            const originalDescription = truncateText(
+              normalizePlainText(row.item.description),
+              Math.max(80, this.settings.descriptionMaxLength)
+            );
+            if (originalDescription) {
+              lines.push("");
+              lines.push("> [Original]");
+              for (const descLine of originalDescription.split("\n")) {
+                lines.push(`> ${descLine}`);
+              }
             }
           }
         }
@@ -771,6 +1119,14 @@ ${feed.topic}`
       lines.push("## Feed Errors");
       lines.push("");
       for (const error of feedErrors) {
+        lines.push(`- ${error}`);
+      }
+      lines.push("");
+    }
+    if (translationStats.errors.length > 0) {
+      lines.push("## Translation Errors");
+      lines.push("");
+      for (const error of translationStats.errors) {
         lines.push(`- ${error}`);
       }
       lines.push("");
@@ -897,6 +1253,21 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
     new import_obsidian.Setting(containerEl).setName("Parsed times").setDesc(
       parsedTimes.length > 0 ? parsedTimes.map((minutes) => minutesToToken(minutes)).join(", ") : "No valid schedule times"
     );
+    new import_obsidian.Setting(containerEl).setName("Catch up on startup").setDesc("When Obsidian starts, capture missed windows since the last pointer.").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.startupCatchupEnabled).onChange(async (value) => {
+        this.plugin.settings.startupCatchupEnabled = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Max catch-up windows per run").setDesc("Safety cap for one run. If missed windows are larger, the next tick keeps catching up.").addText(
+      (text) => text.setPlaceholder("10").setValue(String(this.plugin.settings.maxCatchupWindowsPerRun)).onChange(async (value) => {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 100) {
+          this.plugin.settings.maxCatchupWindowsPerRun = Math.floor(parsed);
+          await this.plugin.saveSettings();
+        }
+      })
+    );
     new import_obsidian.Setting(containerEl).setName("Output folder").setDesc("Vault-relative folder where capture notes are written.").addText(
       (text) => text.setPlaceholder("000-Inbox/RSS").setValue(this.plugin.settings.outputFolder).onChange(async (value) => {
         this.plugin.settings.outputFolder = value.trim();
@@ -930,6 +1301,100 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
         await this.plugin.saveSettings();
       })
     );
+    containerEl.createEl("h3", { text: "Translation" });
+    new import_obsidian.Setting(containerEl).setName("Enable translation").setDesc("Translate non-Korean items while writing notes.").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.translationEnabled).onChange(async (value) => {
+        this.plugin.settings.translationEnabled = value;
+        await this.plugin.saveSettings();
+        this.display();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Translation provider").setDesc("Web mode works without local AI. Ollama mode uses local model you choose.").addDropdown(
+      (dropdown) => dropdown.addOption("web", "Web translate (no local AI)").addOption("ollama", "Local Ollama").addOption("none", "Disabled").setValue(this.plugin.settings.translationProvider).onChange(async (value) => {
+        this.plugin.settings.translationProvider = value === "web" || value === "ollama" || value === "none" ? value : "web";
+        await this.plugin.saveSettings();
+        this.display();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Target language").setDesc("ISO code like ko, en, ja.").addText(
+      (text) => text.setPlaceholder("ko").setValue(this.plugin.settings.translationTargetLanguage).onChange(async (value) => {
+        const normalized = value.trim().toLowerCase();
+        if (normalized) {
+          this.plugin.settings.translationTargetLanguage = normalized;
+          await this.plugin.saveSettings();
+        }
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Translate only non-Korean").setDesc("If enabled, text already containing Hangul is skipped.").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.translationOnlyNonKorean).onChange(async (value) => {
+        this.plugin.settings.translationOnlyNonKorean = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Keep original text").setDesc("When translation is added, keep original description below it.").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.translationKeepOriginal).onChange(async (value) => {
+        this.plugin.settings.translationKeepOriginal = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Translate title").setDesc("Translate item titles.").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.translationTranslateTitle).onChange(async (value) => {
+        this.plugin.settings.translationTranslateTitle = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Translate description").setDesc("Translate description/summary blocks.").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.translationTranslateDescription).onChange(async (value) => {
+        this.plugin.settings.translationTranslateDescription = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    if (this.plugin.settings.translationProvider === "web") {
+      new import_obsidian.Setting(containerEl).setName("Web translation endpoint").setDesc("Default endpoint usually works without API key.").addText(
+        (text) => text.setPlaceholder("https://translate.googleapis.com/translate_a/single").setValue(this.plugin.settings.translationWebEndpoint).onChange(async (value) => {
+          const normalized = normalizeHttpBaseUrl(value);
+          if (normalized) {
+            this.plugin.settings.translationWebEndpoint = normalized;
+            await this.plugin.saveSettings();
+          }
+        })
+      );
+    }
+    if (this.plugin.settings.translationProvider === "ollama") {
+      new import_obsidian.Setting(containerEl).setName("Ollama base URL").setDesc("Example: http://127.0.0.1:11434").addText(
+        (text) => text.setPlaceholder("http://127.0.0.1:11434").setValue(this.plugin.settings.ollamaBaseUrl).onChange(async (value) => {
+          const normalized = normalizeHttpBaseUrl(value);
+          if (normalized) {
+            this.plugin.settings.ollamaBaseUrl = normalized;
+            await this.plugin.saveSettings();
+          }
+        })
+      );
+      const modelOptions = this.plugin.getOllamaModelOptionsForUi();
+      const recommendedModel = this.plugin.getRecommendedOllamaModelForUi();
+      const modelDescription = recommendedModel ? `Detected: ${modelOptions.length} / Recommended: ${recommendedModel}` : "No detected models yet. Click refresh first.";
+      new import_obsidian.Setting(containerEl).setName("Ollama model").setDesc(modelDescription).addDropdown((dropdown) => {
+        if (modelOptions.length === 0) {
+          dropdown.addOption("", "(refresh models first)");
+        } else {
+          for (const model of modelOptions) {
+            dropdown.addOption(model, model);
+          }
+        }
+        const defaultValue = this.plugin.settings.ollamaModel || modelOptions[0] || "";
+        dropdown.setValue(defaultValue).onChange(async (value) => {
+          this.plugin.settings.ollamaModel = value;
+          await this.plugin.saveSettings();
+        });
+        return dropdown;
+      }).addButton(
+        (button) => button.setButtonText("Refresh models").onClick(async () => {
+          await this.plugin.refreshOllamaModels(true);
+          this.display();
+        })
+      );
+      new import_obsidian.Setting(containerEl).setName("Last model refresh").setDesc(this.plugin.settings.ollamaLastModelRefreshIso || "Not refreshed yet");
+    }
     containerEl.createEl("h3", { text: "Filtering, Dedupe, Scoring" });
     new import_obsidian.Setting(containerEl).setName("Enhanced dedupe").setDesc("Deduplicate across feeds using normalized link/title.").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.enhancedDedupeEnabled).onChange(async (value) => {

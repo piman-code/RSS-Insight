@@ -14,24 +14,39 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 - RSS + Atom 파싱
 - 수집 결과를 Vault 폴더에 Markdown 노트로 생성/갱신
 - 자동 실행(Obsidian 실행 중 분 단위 체크) + 수동 명령 실행
+- 시작 시 캐치업(앱이 꺼져 있던 동안 놓친 윈도우 자동 보충 수집)
 - 키워드 포함/제외 필터
 - 피드 간 중복 제거 강화(링크/제목 정규화)
 - 기사별 4요소 점수 템플릿 자동 삽입
+- 영어 등 비한글 항목 자동 번역(웹 번역 또는 로컬 Ollama 선택)
+- Ollama 모델 자동 탐지 + 추천 + 드롭다운 선택
 
 ## Important Limitation
 
-- 자동 수집은 **Obsidian 앱이 실행 중일 때만** 동작합니다.
-- 앱이 꺼져 있는 동안의 정확한 시각 실행 보장이 필요하면 OS 스케줄러와 외부 스크립트 방식을 같이 쓰는 것이 좋습니다.
+- 정확히 08:00/17:00에 실행되려면 해당 시각에 Obsidian이 켜져 있어야 합니다.
+- 앱이 꺼져 있어도, 다음 실행 시 `Catch up on startup`이 켜져 있으면 놓친 윈도우를 자동으로 보충 수집합니다.
+- 아주 오래 꺼져 있었다면 `Max catch-up windows per run` 제한 때문에 여러 틱에 나눠 수집됩니다.
 
 ## Settings
 
 - `Auto fetch`: 자동 체크/수집 on/off
 - `Schedule times`: `08:00,17:00` 형식
+- `Catch up on startup`: 시작 시 누락 윈도우 자동 보충
+- `Max catch-up windows per run`: 1회 실행당 보충 최대 윈도우 수
 - `Output folder`: 노트 저장 폴더 (Vault 기준 경로)
 - `Filename prefix`: 생성 파일명 접두어
 - `Include description`: description/summary 포함 여부
 - `Description max length`: description 최대 길이
 - `Write empty notes`: 결과가 없어도 빈 리포트 생성 여부
+- `Enable translation`: 번역 기능 on/off
+- `Translation provider`: `Web translate` 또는 `Local Ollama`
+- `Target language`: 기본 `ko`
+- `Translate only non-Korean`: 한글 포함 텍스트는 번역 제외
+- `Keep original text`: 번역 결과 아래 원문 유지
+- `Translate title`, `Translate description`: 번역 대상 선택
+- `Web translation endpoint`: 웹 번역 엔드포인트(기본값 제공)
+- `Ollama base URL`: 로컬 Ollama 서버 주소
+- `Ollama model`: 탐지된 모델 중 선택(추천 모델 표시)
 - `Enhanced dedupe`: 피드 간 중복 제거 강화
 - `Keyword filter`: 포함/제외 키워드 필터
 - `Include keywords`: 포함 키워드(쉼표/줄바꿈)
@@ -48,6 +63,7 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 - `Run due RSS window captures now`
 - `Capture latest completed RSS window now`
 - `Sync feeds from RSS Dashboard now`
+- `Refresh Ollama translation models`
 
 ## RSS Dashboard 연동
 
