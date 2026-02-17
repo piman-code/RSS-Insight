@@ -53,6 +53,8 @@ interface CaptureOutcome {
   itemsWithoutDate: number;
   itemsFilteredByKeyword: number;
   itemsDeduped: number;
+  itemsFilteredByQuality: number;
+  itemLimitHit: boolean;
 }
 
 interface RssDashboardFeedRecord {
@@ -87,6 +89,7 @@ interface RssWindowCaptureSettings {
   scoreActionThreshold: number;
   startupCatchupEnabled: boolean;
   maxCatchupWindowsPerRun: number;
+  maxItemsPerWindow: number;
   translationEnabled: boolean;
   translationProvider: TranslationProvider;
   translationTargetLanguage: string;
@@ -111,7 +114,7 @@ const DEFAULT_SETTINGS: RssWindowCaptureSettings = {
   descriptionMaxLength: 500,
   writeEmptyNote: true,
   lastWindowEndIso: "",
-  rssDashboardSyncEnabled: true,
+  rssDashboardSyncEnabled: false,
   rssDashboardDataPath: ".obsidian/plugins/rss-dashboard/data.json",
   rssDashboardLastSyncAtIso: "",
   rssDashboardLastMtime: 0,
@@ -124,6 +127,7 @@ const DEFAULT_SETTINGS: RssWindowCaptureSettings = {
   scoreActionThreshold: 14,
   startupCatchupEnabled: true,
   maxCatchupWindowsPerRun: 10,
+  maxItemsPerWindow: 20,
   translationEnabled: false,
   translationProvider: "web",
   translationTargetLanguage: "ko",
@@ -143,6 +147,7 @@ const SCHEDULER_TICK_MS = 60 * 1000;
 const MAX_TRANSLATION_INPUT_LENGTH = 2000;
 const TRANSLATED_DESCRIPTION_MAX_LENGTH = 300;
 const MAX_DESCRIPTION_ENRICH_ITEMS_PER_WINDOW = 40;
+const ENFORCED_MAX_ITEMS_PER_WINDOW = 20;
 const TRACKING_QUERY_KEYS = new Set([
   "utm_source",
   "utm_medium",
@@ -322,6 +327,78 @@ function canonicalizeLinkForDedupe(raw: string): string {
   } catch {
     return trimmed.split("#")[0];
   }
+}
+
+function looksLikeLowSignalTitle(raw: string): boolean {
+  const normalized = raw.toLowerCase();
+  return /(광고|협찬|이벤트|promo|promoted|sponsored|advertisement|newsletter)/i.test(normalized);
+}
+
+function looksLikeArticleLink(raw: string): boolean {
+  const link = raw.trim();
+  if (!link) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(link);
+    const pathname = parsed.pathname.toLowerCase();
+    if (/(\/news\/|\/article\/|\/story\/)/.test(pathname)) {
+      return true;
+    }
+    if (/\d{4}\/\d{2}\/\d{2}/.test(pathname)) {
+      return true;
+    }
+    if (/\d{6,}/.test(pathname)) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function scoreWindowItemQuality(item: ParsedFeedItem, windowEnd: Date): number {
+  let score = 0;
+
+  if (item.published) {
+    const ageMinutes = Math.max(0, (windowEnd.getTime() - item.published.getTime()) / 60000);
+    score += Math.max(0, 8 - ageMinutes / 90);
+  }
+
+  const title = normalizePlainText(item.title);
+  const titleLength = title.length;
+  if (titleLength >= 18 && titleLength <= 120) {
+    score += 2;
+  } else if (titleLength >= 8) {
+    score += 1;
+  }
+
+  const descriptionLength = normalizePlainText(item.description).length;
+  if (descriptionLength >= 320) {
+    score += 8;
+  } else if (descriptionLength >= 180) {
+    score += 6;
+  } else if (descriptionLength >= 100) {
+    score += 4;
+  } else if (descriptionLength >= 50) {
+    score += 2;
+  } else if (descriptionLength > 0) {
+    score += 1;
+  }
+
+  const link = item.link.trim();
+  if (link.startsWith("https://")) {
+    score += 1;
+  }
+  if (looksLikeArticleLink(link)) {
+    score += 2;
+  }
+  if (looksLikeLowSignalTitle(title)) {
+    score -= 4;
+  }
+
+  return score;
 }
 
 function pad2(value: number): string {
@@ -722,6 +799,7 @@ export default class RssWindowCapturePlugin extends Plugin {
       1,
       Math.min(100, Math.floor(Number(this.settings.maxCatchupWindowsPerRun) || 10)),
     );
+    this.settings.maxItemsPerWindow = ENFORCED_MAX_ITEMS_PER_WINDOW;
     this.settings.translationProvider = this.normalizeTranslationProvider(
       this.settings.translationProvider,
     );
@@ -807,7 +885,7 @@ export default class RssWindowCapturePlugin extends Plugin {
           topic: existing?.topic?.trim() ? existing.topic.trim() : defaultTopic,
           name: existing?.name?.trim() ? existing.name.trim() : defaultName,
           url,
-          enabled: existing ? existing.enabled : true,
+          enabled: existing ? existing.enabled : false,
           source: "rss-dashboard",
         });
       }
@@ -1290,6 +1368,7 @@ export default class RssWindowCapturePlugin extends Plugin {
     this.runInProgress = true;
     let processedCount = 0;
     let totalItems = 0;
+    let windowsHitItemLimit = 0;
 
     try {
       for (const windowEnd of dueWindowEnds) {
@@ -1301,6 +1380,9 @@ export default class RssWindowCapturePlugin extends Plugin {
 
         processedCount += 1;
         totalItems += outcome.totalItems;
+        if (outcome.itemLimitHit) {
+          windowsHitItemLimit += 1;
+        }
 
         if (outcome.feedErrors.length > 0) {
           new Notice(
@@ -1317,7 +1399,10 @@ export default class RssWindowCapturePlugin extends Plugin {
     }
 
     if (reason === "manual") {
-      new Notice(`Captured ${processedCount} window(s), ${totalItems} item(s).`, 6000);
+      const limitSuffix = windowsHitItemLimit > 0
+        ? ` (item limit hit in ${windowsHitItemLimit} window(s))`
+        : "";
+      new Notice(`Captured ${processedCount} window(s), ${totalItems} item(s)${limitSuffix}.`, 6000);
     }
   }
 
@@ -1360,8 +1445,9 @@ export default class RssWindowCapturePlugin extends Plugin {
         this.settings.lastWindowEndIso = latestWindowEnd.toISOString();
         await this.saveSettings();
       }
+      const limitSuffix = outcome.itemLimitHit ? " (item limit hit)" : "";
       new Notice(
-        `Captured latest window ${formatLocalDateTime(latestWindowEnd)} with ${outcome.totalItems} item(s).`,
+        `Captured latest window ${formatLocalDateTime(latestWindowEnd)} with ${outcome.totalItems} item(s)${limitSuffix}.`,
         6000,
       );
     } catch (error) {
@@ -1461,12 +1547,16 @@ export default class RssWindowCapturePlugin extends Plugin {
     feeds: FeedSource[],
   ): Promise<CaptureOutcome> {
     const grouped = new Map<string, WindowItem[]>();
+    const windowCandidates: WindowItem[] = [];
     const itemKeys = new Set<string>();
     const feedErrors: string[] = [];
     let totalItems = 0;
     let itemsWithoutDate = 0;
     let itemsFilteredByKeyword = 0;
     let itemsDeduped = 0;
+    let itemsFilteredByQuality = 0;
+    const maxItemsPerWindow = ENFORCED_MAX_ITEMS_PER_WINDOW;
+    let itemLimitHit = false;
     const includeKeywords = parseKeywordList(this.settings.includeKeywords);
     const excludeKeywords = parseKeywordList(this.settings.excludeKeywords);
 
@@ -1515,13 +1605,38 @@ export default class RssWindowCapturePlugin extends Plugin {
         }
         dedupeKeys.forEach((key) => itemKeys.add(key));
 
-        const topic = feed.topic.trim() || "Uncategorized";
-        if (!grouped.has(topic)) {
-          grouped.set(topic, []);
-        }
-        grouped.get(topic)?.push({ feed, item });
-        totalItems += 1;
+        windowCandidates.push({ feed, item });
       }
+    }
+
+    const rankedRows = windowCandidates
+      .map((row) => ({
+        row,
+        qualityScore: scoreWindowItemQuality(row.item, windowEnd),
+      }))
+      .sort((a, b) => {
+        if (a.qualityScore !== b.qualityScore) {
+          return b.qualityScore - a.qualityScore;
+        }
+        const aTime = a.row.item.published ? a.row.item.published.getTime() : 0;
+        const bTime = b.row.item.published ? b.row.item.published.getTime() : 0;
+        if (aTime !== bTime) {
+          return bTime - aTime;
+        }
+        return a.row.item.title.localeCompare(b.row.item.title);
+      });
+
+    const selectedRows = rankedRows.slice(0, maxItemsPerWindow).map((entry) => entry.row);
+    itemLimitHit = rankedRows.length > selectedRows.length;
+    itemsFilteredByQuality = Math.max(0, rankedRows.length - selectedRows.length);
+    totalItems = selectedRows.length;
+
+    for (const row of selectedRows) {
+      const topic = row.feed.topic.trim() || "Uncategorized";
+      if (!grouped.has(topic)) {
+        grouped.set(topic, []);
+      }
+      grouped.get(topic)?.push(row);
     }
 
     if (totalItems === 0 && !this.settings.writeEmptyNote && feedErrors.length === 0) {
@@ -1533,6 +1648,8 @@ export default class RssWindowCapturePlugin extends Plugin {
         itemsWithoutDate,
         itemsFilteredByKeyword,
         itemsDeduped,
+        itemsFilteredByQuality,
+        itemLimitHit,
       };
     }
 
@@ -1549,8 +1666,10 @@ export default class RssWindowCapturePlugin extends Plugin {
       itemsWithoutDate,
       itemsFilteredByKeyword,
       itemsDeduped,
+      itemsFilteredByQuality,
       feedErrors,
       translationStats,
+      itemLimitHit,
     );
 
     await this.ensureFolderExists(this.resolveOutputFolder());
@@ -1564,6 +1683,8 @@ export default class RssWindowCapturePlugin extends Plugin {
       itemsWithoutDate,
       itemsFilteredByKeyword,
       itemsDeduped,
+      itemsFilteredByQuality,
+      itemLimitHit,
     };
   }
 
@@ -1587,8 +1708,10 @@ export default class RssWindowCapturePlugin extends Plugin {
     itemsWithoutDate: number,
     itemsFilteredByKeyword: number,
     itemsDeduped: number,
+    itemsFilteredByQuality: number,
     feedErrors: string[],
     translationStats: TranslationStats,
+    itemLimitHit: boolean,
   ): string {
     const lines: string[] = [];
     const defaultScore = this.settings.scoreDefaultValue;
@@ -1604,7 +1727,10 @@ export default class RssWindowCapturePlugin extends Plugin {
     lines.push(`items_without_date: ${itemsWithoutDate}`);
     lines.push(`items_filtered_by_keyword: ${itemsFilteredByKeyword}`);
     lines.push(`items_deduped: ${itemsDeduped}`);
+    lines.push(`items_filtered_by_quality: ${itemsFilteredByQuality}`);
     lines.push(`feed_errors: ${feedErrors.length}`);
+    lines.push(`max_items_per_window: ${this.settings.maxItemsPerWindow}`);
+    lines.push(`item_limit_hit: ${itemLimitHit ? "true" : "false"}`);
     lines.push(`translation_provider: "${translationStats.provider}"`);
     if (translationStats.model) {
       lines.push(`translation_model: "${escapeYamlString(translationStats.model)}"`);
@@ -1624,6 +1750,9 @@ export default class RssWindowCapturePlugin extends Plugin {
     lines.push(`- Items captured: ${totalItems}`);
     lines.push(`- Filtered by keywords: ${itemsFilteredByKeyword}`);
     lines.push(`- Deduped: ${itemsDeduped}`);
+    lines.push(`- Filtered by quality: ${itemsFilteredByQuality}`);
+    lines.push(`- Max items per window: ${this.settings.maxItemsPerWindow}`);
+    lines.push(`- Item limit hit: ${itemLimitHit ? "yes" : "no"}`);
     lines.push(`- Translation provider: ${translationStats.provider}`);
     lines.push(`- Titles translated: ${translationStats.titlesTranslated}`);
     lines.push(`- Descriptions translated: ${translationStats.descriptionsTranslated}`);
@@ -1910,6 +2039,16 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
               await this.plugin.saveSettings();
             }
           }),
+      );
+
+    new Setting(containerEl)
+      .setName("Max items per window")
+      .setDesc("Quality-first fixed cap. RSS Insight always keeps top 20 items per window.")
+      .addText((text) =>
+        text
+          .setPlaceholder(String(ENFORCED_MAX_ITEMS_PER_WINDOW))
+          .setValue(String(ENFORCED_MAX_ITEMS_PER_WINDOW))
+          .setDisabled(true),
       );
 
     new Setting(containerEl)

@@ -33,7 +33,7 @@ var DEFAULT_SETTINGS = {
   descriptionMaxLength: 500,
   writeEmptyNote: true,
   lastWindowEndIso: "",
-  rssDashboardSyncEnabled: true,
+  rssDashboardSyncEnabled: false,
   rssDashboardDataPath: ".obsidian/plugins/rss-dashboard/data.json",
   rssDashboardLastSyncAtIso: "",
   rssDashboardLastMtime: 0,
@@ -46,6 +46,7 @@ var DEFAULT_SETTINGS = {
   scoreActionThreshold: 14,
   startupCatchupEnabled: true,
   maxCatchupWindowsPerRun: 10,
+  maxItemsPerWindow: 20,
   translationEnabled: false,
   translationProvider: "web",
   translationTargetLanguage: "ko",
@@ -64,6 +65,7 @@ var SCHEDULER_TICK_MS = 60 * 1e3;
 var MAX_TRANSLATION_INPUT_LENGTH = 2e3;
 var TRANSLATED_DESCRIPTION_MAX_LENGTH = 300;
 var MAX_DESCRIPTION_ENRICH_ITEMS_PER_WINDOW = 40;
+var ENFORCED_MAX_ITEMS_PER_WINDOW = 20;
 var TRACKING_QUERY_KEYS = /* @__PURE__ */ new Set([
   "utm_source",
   "utm_medium",
@@ -218,6 +220,69 @@ function canonicalizeLinkForDedupe(raw) {
   } catch (e) {
     return trimmed.split("#")[0];
   }
+}
+function looksLikeLowSignalTitle(raw) {
+  const normalized = raw.toLowerCase();
+  return /(광고|협찬|이벤트|promo|promoted|sponsored|advertisement|newsletter)/i.test(normalized);
+}
+function looksLikeArticleLink(raw) {
+  const link = raw.trim();
+  if (!link) {
+    return false;
+  }
+  try {
+    const parsed = new URL(link);
+    const pathname = parsed.pathname.toLowerCase();
+    if (/(\/news\/|\/article\/|\/story\/)/.test(pathname)) {
+      return true;
+    }
+    if (/\d{4}\/\d{2}\/\d{2}/.test(pathname)) {
+      return true;
+    }
+    if (/\d{6,}/.test(pathname)) {
+      return true;
+    }
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+function scoreWindowItemQuality(item, windowEnd) {
+  let score = 0;
+  if (item.published) {
+    const ageMinutes = Math.max(0, (windowEnd.getTime() - item.published.getTime()) / 6e4);
+    score += Math.max(0, 8 - ageMinutes / 90);
+  }
+  const title = normalizePlainText(item.title);
+  const titleLength = title.length;
+  if (titleLength >= 18 && titleLength <= 120) {
+    score += 2;
+  } else if (titleLength >= 8) {
+    score += 1;
+  }
+  const descriptionLength = normalizePlainText(item.description).length;
+  if (descriptionLength >= 320) {
+    score += 8;
+  } else if (descriptionLength >= 180) {
+    score += 6;
+  } else if (descriptionLength >= 100) {
+    score += 4;
+  } else if (descriptionLength >= 50) {
+    score += 2;
+  } else if (descriptionLength > 0) {
+    score += 1;
+  }
+  const link = item.link.trim();
+  if (link.startsWith("https://")) {
+    score += 1;
+  }
+  if (looksLikeArticleLink(link)) {
+    score += 2;
+  }
+  if (looksLikeLowSignalTitle(title)) {
+    score -= 4;
+  }
+  return score;
 }
 function pad2(value) {
   return String(value).padStart(2, "0");
@@ -547,6 +612,7 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
       1,
       Math.min(100, Math.floor(Number(this.settings.maxCatchupWindowsPerRun) || 10))
     );
+    this.settings.maxItemsPerWindow = ENFORCED_MAX_ITEMS_PER_WINDOW;
     this.settings.translationProvider = this.normalizeTranslationProvider(
       this.settings.translationProvider
     );
@@ -612,7 +678,7 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
           topic: ((_b = existing == null ? void 0 : existing.topic) == null ? void 0 : _b.trim()) ? existing.topic.trim() : defaultTopic,
           name: ((_c = existing == null ? void 0 : existing.name) == null ? void 0 : _c.trim()) ? existing.name.trim() : defaultName,
           url,
-          enabled: existing ? existing.enabled : true,
+          enabled: existing ? existing.enabled : false,
           source: "rss-dashboard"
         });
       }
@@ -995,6 +1061,7 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
     this.runInProgress = true;
     let processedCount = 0;
     let totalItems = 0;
+    let windowsHitItemLimit = 0;
     try {
       for (const windowEnd of dueWindowEnds) {
         const windowStart = this.findPreviousBoundary(windowEnd, scheduleMinutes);
@@ -1003,6 +1070,9 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
         await this.saveSettings();
         processedCount += 1;
         totalItems += outcome.totalItems;
+        if (outcome.itemLimitHit) {
+          windowsHitItemLimit += 1;
+        }
         if (outcome.feedErrors.length > 0) {
           new import_obsidian.Notice(
             `RSS window ${formatLocalDateTime(windowEnd)} captured with ${outcome.feedErrors.length} feed errors.`,
@@ -1017,7 +1087,8 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
       this.runInProgress = false;
     }
     if (reason === "manual") {
-      new import_obsidian.Notice(`Captured ${processedCount} window(s), ${totalItems} item(s).`, 6e3);
+      const limitSuffix = windowsHitItemLimit > 0 ? ` (item limit hit in ${windowsHitItemLimit} window(s))` : "";
+      new import_obsidian.Notice(`Captured ${processedCount} window(s), ${totalItems} item(s)${limitSuffix}.`, 6e3);
     }
   }
   async captureLatestCompletedWindow() {
@@ -1051,8 +1122,9 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
         this.settings.lastWindowEndIso = latestWindowEnd.toISOString();
         await this.saveSettings();
       }
+      const limitSuffix = outcome.itemLimitHit ? " (item limit hit)" : "";
       new import_obsidian.Notice(
-        `Captured latest window ${formatLocalDateTime(latestWindowEnd)} with ${outcome.totalItems} item(s).`,
+        `Captured latest window ${formatLocalDateTime(latestWindowEnd)} with ${outcome.totalItems} item(s)${limitSuffix}.`,
         6e3
       );
     } catch (error) {
@@ -1129,12 +1201,16 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
   async captureWindow(windowStart, windowEnd, feeds) {
     var _a;
     const grouped = /* @__PURE__ */ new Map();
+    const windowCandidates = [];
     const itemKeys = /* @__PURE__ */ new Set();
     const feedErrors = [];
     let totalItems = 0;
     let itemsWithoutDate = 0;
     let itemsFilteredByKeyword = 0;
     let itemsDeduped = 0;
+    let itemsFilteredByQuality = 0;
+    const maxItemsPerWindow = ENFORCED_MAX_ITEMS_PER_WINDOW;
+    let itemLimitHit = false;
     const includeKeywords = parseKeywordList(this.settings.includeKeywords);
     const excludeKeywords = parseKeywordList(this.settings.excludeKeywords);
     const fetchResults = await Promise.allSettled(
@@ -1178,13 +1254,33 @@ ${feed.topic}`
           continue;
         }
         dedupeKeys.forEach((key) => itemKeys.add(key));
-        const topic = feed.topic.trim() || "Uncategorized";
-        if (!grouped.has(topic)) {
-          grouped.set(topic, []);
-        }
-        (_a = grouped.get(topic)) == null ? void 0 : _a.push({ feed, item });
-        totalItems += 1;
+        windowCandidates.push({ feed, item });
       }
+    }
+    const rankedRows = windowCandidates.map((row) => ({
+      row,
+      qualityScore: scoreWindowItemQuality(row.item, windowEnd)
+    })).sort((a, b) => {
+      if (a.qualityScore !== b.qualityScore) {
+        return b.qualityScore - a.qualityScore;
+      }
+      const aTime = a.row.item.published ? a.row.item.published.getTime() : 0;
+      const bTime = b.row.item.published ? b.row.item.published.getTime() : 0;
+      if (aTime !== bTime) {
+        return bTime - aTime;
+      }
+      return a.row.item.title.localeCompare(b.row.item.title);
+    });
+    const selectedRows = rankedRows.slice(0, maxItemsPerWindow).map((entry) => entry.row);
+    itemLimitHit = rankedRows.length > selectedRows.length;
+    itemsFilteredByQuality = Math.max(0, rankedRows.length - selectedRows.length);
+    totalItems = selectedRows.length;
+    for (const row of selectedRows) {
+      const topic = row.feed.topic.trim() || "Uncategorized";
+      if (!grouped.has(topic)) {
+        grouped.set(topic, []);
+      }
+      (_a = grouped.get(topic)) == null ? void 0 : _a.push(row);
     }
     if (totalItems === 0 && !this.settings.writeEmptyNote && feedErrors.length === 0) {
       return {
@@ -1194,7 +1290,9 @@ ${feed.topic}`
         feedsChecked: feeds.length,
         itemsWithoutDate,
         itemsFilteredByKeyword,
-        itemsDeduped
+        itemsDeduped,
+        itemsFilteredByQuality,
+        itemLimitHit
       };
     }
     await this.enrichMissingDescriptions(grouped);
@@ -1209,8 +1307,10 @@ ${feed.topic}`
       itemsWithoutDate,
       itemsFilteredByKeyword,
       itemsDeduped,
+      itemsFilteredByQuality,
       feedErrors,
-      translationStats
+      translationStats,
+      itemLimitHit
     );
     await this.ensureFolderExists(this.resolveOutputFolder());
     await this.writeOrOverwriteNote(notePath, content);
@@ -1221,7 +1321,9 @@ ${feed.topic}`
       feedsChecked: feeds.length,
       itemsWithoutDate,
       itemsFilteredByKeyword,
-      itemsDeduped
+      itemsDeduped,
+      itemsFilteredByQuality,
+      itemLimitHit
     };
   }
   buildOutputPath(windowEnd) {
@@ -1233,7 +1335,7 @@ ${feed.topic}`
   resolveOutputFolder() {
     return (0, import_obsidian.normalizePath)(this.settings.outputFolder.trim() || DEFAULT_SETTINGS.outputFolder);
   }
-  buildNoteContent(windowStart, windowEnd, grouped, feedsChecked, totalItems, itemsWithoutDate, itemsFilteredByKeyword, itemsDeduped, feedErrors, translationStats) {
+  buildNoteContent(windowStart, windowEnd, grouped, feedsChecked, totalItems, itemsWithoutDate, itemsFilteredByKeyword, itemsDeduped, itemsFilteredByQuality, feedErrors, translationStats, itemLimitHit) {
     var _a;
     const lines = [];
     const defaultScore = this.settings.scoreDefaultValue;
@@ -1248,7 +1350,10 @@ ${feed.topic}`
     lines.push(`items_without_date: ${itemsWithoutDate}`);
     lines.push(`items_filtered_by_keyword: ${itemsFilteredByKeyword}`);
     lines.push(`items_deduped: ${itemsDeduped}`);
+    lines.push(`items_filtered_by_quality: ${itemsFilteredByQuality}`);
     lines.push(`feed_errors: ${feedErrors.length}`);
+    lines.push(`max_items_per_window: ${this.settings.maxItemsPerWindow}`);
+    lines.push(`item_limit_hit: ${itemLimitHit ? "true" : "false"}`);
     lines.push(`translation_provider: "${translationStats.provider}"`);
     if (translationStats.model) {
       lines.push(`translation_model: "${escapeYamlString(translationStats.model)}"`);
@@ -1267,6 +1372,9 @@ ${feed.topic}`
     lines.push(`- Items captured: ${totalItems}`);
     lines.push(`- Filtered by keywords: ${itemsFilteredByKeyword}`);
     lines.push(`- Deduped: ${itemsDeduped}`);
+    lines.push(`- Filtered by quality: ${itemsFilteredByQuality}`);
+    lines.push(`- Max items per window: ${this.settings.maxItemsPerWindow}`);
+    lines.push(`- Item limit hit: ${itemLimitHit ? "yes" : "no"}`);
     lines.push(`- Translation provider: ${translationStats.provider}`);
     lines.push(`- Titles translated: ${translationStats.titlesTranslated}`);
     lines.push(`- Descriptions translated: ${translationStats.descriptionsTranslated}`);
@@ -1486,6 +1594,9 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
           await this.plugin.saveSettings();
         }
       })
+    );
+    new import_obsidian.Setting(containerEl).setName("Max items per window").setDesc("Quality-first fixed cap. RSS Insight always keeps top 20 items per window.").addText(
+      (text) => text.setPlaceholder(String(ENFORCED_MAX_ITEMS_PER_WINDOW)).setValue(String(ENFORCED_MAX_ITEMS_PER_WINDOW)).setDisabled(true)
     );
     new import_obsidian.Setting(containerEl).setName("Output folder").setDesc("Vault-relative folder where capture notes are written.").addText(
       (text) => text.setPlaceholder("000-Inbox/RSS").setValue(this.plugin.settings.outputFolder).onChange(async (value) => {
