@@ -17,7 +17,8 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 - 시작 시 캐치업(앱이 꺼져 있던 동안 놓친 윈도우 자동 보충 수집)
 - 키워드 포함/제외 필터
 - 피드 간 중복 제거 강화(링크/제목 정규화)
-- 품질 점수 기반 선별 후 윈도우당 상위 20개 기사만 고정 저장
+- 품질 점수 기반 선별 + 토픽 다양성 보정으로 기사 선택
+- 기본 상한 + 구독 피드/토픽 규모 기반 자동 상한 확장
 - 기사별 4요소 점수 템플릿 자동 삽입
 - 영어 등 비한글 항목 자동 번역(웹 번역 또는 로컬 Ollama 선택)
 - Ollama 모델 자동 탐지 + 추천 + 드롭다운 선택
@@ -34,10 +35,15 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 ## Settings
 
 - `Auto fetch`: 자동 체크/수집 on/off
+- `Settings language`: 설정창 언어 전환(한국어/영문, 동시 표시는 안 함)
 - `Schedule times`: `08:00,17:00` 형식
 - `Catch up on startup`: 시작 시 누락 윈도우 자동 보충
 - `Max catch-up windows per run`: 1회 실행당 보충 최대 윈도우 수
-- `Max items per window`: 품질 우선 고정 상한(Top 20, 사용자 변경 불가)
+- `Base max items per window`: 품질 선별 기본 상한
+- `Adaptive max items`: 구독 피드/토픽 수를 기준으로 상한 자동 확장
+- `Adaptive cap upper bound`: 자동 확장 시 최대 상한
+- `Topic diversity minimum per topic`: 토픽별 최소 확보 개수(0~3)
+- `Topic diversity penalty`: 토픽 편중 완화 가중치(높을수록 분산 강화)
 - `Output folder`: 노트 저장 폴더 (Vault 기준 경로)
 - `Filename prefix`: 생성 파일명 접두어
 - `Include description`: description/summary 포함 여부
@@ -59,6 +65,7 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 - `Score template`: 점수 템플릿 삽입 여부
 - `Default score value`: 점수 기본값(1-5)
 - `Action threshold`: 액션 후보 기준 점수
+  - 노트 상단 요약에 1회 표시됩니다(기사별 반복 출력 제거)
 - `Enable RSS Dashboard sync`: RSS Dashboard에 추가한 피드를 자동 동기화 (기본값: 꺼짐)
 - `RSS Dashboard data path`: 기본값 `.obsidian/plugins/rss-dashboard/data.json`
 - `Feeds`: topic/name/url/enabled 관리

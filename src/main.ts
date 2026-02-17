@@ -36,6 +36,7 @@ interface WindowItem {
 }
 
 type TranslationProvider = "none" | "web" | "ollama";
+type UiLanguage = "ko" | "en";
 
 interface TranslationStats {
   provider: TranslationProvider;
@@ -45,9 +46,15 @@ interface TranslationStats {
   errors: string[];
 }
 
+interface ScoredWindowRow {
+  row: WindowItem;
+  qualityScore: number;
+}
+
 interface CaptureOutcome {
   notePath: string | null;
   totalItems: number;
+  effectiveMaxItemsPerWindow: number;
   feedErrors: string[];
   feedsChecked: number;
   itemsWithoutDate: number;
@@ -68,6 +75,7 @@ interface RssDashboardDataFile {
 }
 
 interface RssWindowCaptureSettings {
+  uiLanguage: UiLanguage;
   autoFetchEnabled: boolean;
   scheduleTimes: string;
   outputFolder: string;
@@ -90,6 +98,10 @@ interface RssWindowCaptureSettings {
   startupCatchupEnabled: boolean;
   maxCatchupWindowsPerRun: number;
   maxItemsPerWindow: number;
+  adaptiveItemCapEnabled: boolean;
+  adaptiveItemCapMax: number;
+  topicDiversityMinPerTopic: number;
+  topicDiversityPenaltyPerSelected: number;
   translationEnabled: boolean;
   translationProvider: TranslationProvider;
   translationTargetLanguage: string;
@@ -106,6 +118,7 @@ interface RssWindowCaptureSettings {
 }
 
 const DEFAULT_SETTINGS: RssWindowCaptureSettings = {
+  uiLanguage: "ko",
   autoFetchEnabled: true,
   scheduleTimes: "08:00,17:00",
   outputFolder: "000-Inbox/RSS",
@@ -128,6 +141,10 @@ const DEFAULT_SETTINGS: RssWindowCaptureSettings = {
   startupCatchupEnabled: true,
   maxCatchupWindowsPerRun: 10,
   maxItemsPerWindow: 20,
+  adaptiveItemCapEnabled: true,
+  adaptiveItemCapMax: 50,
+  topicDiversityMinPerTopic: 1,
+  topicDiversityPenaltyPerSelected: 1.25,
   translationEnabled: false,
   translationProvider: "web",
   translationTargetLanguage: "ko",
@@ -147,7 +164,12 @@ const SCHEDULER_TICK_MS = 60 * 1000;
 const MAX_TRANSLATION_INPUT_LENGTH = 2000;
 const TRANSLATED_DESCRIPTION_MAX_LENGTH = 300;
 const MAX_DESCRIPTION_ENRICH_ITEMS_PER_WINDOW = 40;
-const ENFORCED_MAX_ITEMS_PER_WINDOW = 20;
+const MIN_BASE_ITEMS_PER_WINDOW = 10;
+const MAX_BASE_ITEMS_PER_WINDOW = 250;
+const MIN_TOPIC_DIVERSITY_PER_TOPIC = 0;
+const MAX_TOPIC_DIVERSITY_PER_TOPIC = 3;
+const MIN_TOPIC_DIVERSITY_PENALTY = 0;
+const MAX_TOPIC_DIVERSITY_PENALTY = 5;
 const TRACKING_QUERY_KEYS = new Set([
   "utm_source",
   "utm_medium",
@@ -401,6 +423,108 @@ function scoreWindowItemQuality(item: ParsedFeedItem, windowEnd: Date): number {
   return score;
 }
 
+function getRowTopic(row: WindowItem): string {
+  return row.feed.topic.trim() || "Uncategorized";
+}
+
+function selectRowsWithTopicDiversity(
+  rankedRows: ScoredWindowRow[],
+  limit: number,
+  minPerTopic: number,
+  penaltyPerSelected: number,
+): WindowItem[] {
+  if (limit <= 0 || rankedRows.length === 0) {
+    return [];
+  }
+
+  const perTopic = new Map<string, ScoredWindowRow[]>();
+  for (const entry of rankedRows) {
+    const topic = getRowTopic(entry.row);
+    if (!perTopic.has(topic)) {
+      perTopic.set(topic, []);
+    }
+    perTopic.get(topic)?.push(entry);
+  }
+
+  const selected: WindowItem[] = [];
+  const selectedByTopic = new Map<string, number>();
+
+  const sortedTopicsByTopScore = (): string[] =>
+    Array.from(perTopic.entries())
+      .filter(([, queue]) => queue.length > 0)
+      .sort((a, b) => {
+        const aTop = a[1][0]?.qualityScore ?? Number.NEGATIVE_INFINITY;
+        const bTop = b[1][0]?.qualityScore ?? Number.NEGATIVE_INFINITY;
+        if (aTop !== bTop) {
+          return bTop - aTop;
+        }
+        return a[0].localeCompare(b[0]);
+      })
+      .map(([topic]) => topic);
+
+  const takeTopFromTopic = (topic: string): boolean => {
+    const queue = perTopic.get(topic);
+    if (!queue || queue.length === 0) {
+      return false;
+    }
+    const entry = queue.shift();
+    if (!entry) {
+      return false;
+    }
+    selected.push(entry.row);
+    selectedByTopic.set(topic, (selectedByTopic.get(topic) ?? 0) + 1);
+    return true;
+  };
+
+  for (let pass = 0; pass < minPerTopic; pass += 1) {
+    const topicsInPass = sortedTopicsByTopScore();
+    if (topicsInPass.length === 0) {
+      break;
+    }
+    for (const topic of topicsInPass) {
+      if (!takeTopFromTopic(topic)) {
+        continue;
+      }
+      if (selected.length >= limit) {
+        return selected;
+      }
+    }
+  }
+
+  while (selected.length < limit) {
+    let bestTopic = "";
+    let bestAdjustedScore = Number.NEGATIVE_INFINITY;
+    let bestRawScore = Number.NEGATIVE_INFINITY;
+
+    for (const [topic, queue] of perTopic.entries()) {
+      if (queue.length === 0) {
+        continue;
+      }
+      const rawScore = queue[0]?.qualityScore ?? Number.NEGATIVE_INFINITY;
+      const selectedCount = selectedByTopic.get(topic) ?? 0;
+      const adjustedScore = rawScore - (selectedCount * penaltyPerSelected);
+      if (
+        adjustedScore > bestAdjustedScore
+        || (adjustedScore === bestAdjustedScore && rawScore > bestRawScore)
+        || (adjustedScore === bestAdjustedScore && rawScore === bestRawScore && topic < bestTopic)
+      ) {
+        bestTopic = topic;
+        bestAdjustedScore = adjustedScore;
+        bestRawScore = rawScore;
+      }
+    }
+
+    if (!bestTopic) {
+      break;
+    }
+
+    if (!takeTopFromTopic(bestTopic)) {
+      break;
+    }
+  }
+
+  return selected;
+}
 function pad2(value: number): string {
   return String(value).padStart(2, "0");
 }
@@ -774,6 +898,7 @@ export default class RssWindowCapturePlugin extends Plugin {
   async loadSettings(): Promise<void> {
     const loaded = await this.loadData();
     this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
+    this.settings.uiLanguage = this.settings.uiLanguage === "en" ? "en" : "ko";
     this.settings.feeds = (this.settings.feeds || []).map((feed) => ({
       id: feed.id || createFeedId(),
       topic: normalizeTopic(feed.topic || "Uncategorized"),
@@ -799,7 +924,32 @@ export default class RssWindowCapturePlugin extends Plugin {
       1,
       Math.min(100, Math.floor(Number(this.settings.maxCatchupWindowsPerRun) || 10)),
     );
-    this.settings.maxItemsPerWindow = ENFORCED_MAX_ITEMS_PER_WINDOW;
+    this.settings.maxItemsPerWindow = Math.max(
+      MIN_BASE_ITEMS_PER_WINDOW,
+      Math.min(MAX_BASE_ITEMS_PER_WINDOW, Math.floor(Number(this.settings.maxItemsPerWindow) || 20)),
+    );
+    this.settings.adaptiveItemCapEnabled = this.settings.adaptiveItemCapEnabled !== false;
+    this.settings.adaptiveItemCapMax = Math.max(
+      this.settings.maxItemsPerWindow,
+      Math.min(MAX_BASE_ITEMS_PER_WINDOW, Math.floor(Number(this.settings.adaptiveItemCapMax) || 50)),
+    );
+    const parsedTopicMin = Number(this.settings.topicDiversityMinPerTopic);
+    const safeTopicMin = Number.isFinite(parsedTopicMin) ? parsedTopicMin : 1;
+    this.settings.topicDiversityMinPerTopic = Math.max(
+      MIN_TOPIC_DIVERSITY_PER_TOPIC,
+      Math.min(MAX_TOPIC_DIVERSITY_PER_TOPIC, Math.floor(safeTopicMin)),
+    );
+    const parsedDiversityPenalty = Number(this.settings.topicDiversityPenaltyPerSelected);
+    const safeDiversityPenalty = Number.isFinite(parsedDiversityPenalty)
+      ? parsedDiversityPenalty
+      : 1.25;
+    this.settings.topicDiversityPenaltyPerSelected = Math.max(
+      MIN_TOPIC_DIVERSITY_PENALTY,
+      Math.min(
+        MAX_TOPIC_DIVERSITY_PENALTY,
+        Math.round(safeDiversityPenalty * 100) / 100,
+      ),
+    );
     this.settings.translationProvider = this.normalizeTranslationProvider(
       this.settings.translationProvider,
     );
@@ -823,6 +973,35 @@ export default class RssWindowCapturePlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+  }
+
+  private resolveEffectiveMaxItemsPerWindow(feeds: FeedSource[]): number {
+    const baseMax = Math.max(
+      MIN_BASE_ITEMS_PER_WINDOW,
+      Math.min(MAX_BASE_ITEMS_PER_WINDOW, Math.floor(Number(this.settings.maxItemsPerWindow) || 20)),
+    );
+
+    if (!this.settings.adaptiveItemCapEnabled) {
+      return baseMax;
+    }
+
+    const enabledFeeds = feeds.filter((feed) => feed.enabled && feed.url.trim().length > 0);
+    const topicCount = new Set(
+      enabledFeeds.map((feed) => normalizeTopic(feed.topic || "Uncategorized")),
+    ).size;
+    const feedBonus = Math.floor(enabledFeeds.length / 3);
+    const topicBonus = Math.floor(topicCount / 2);
+    const adaptiveMax = Math.max(
+      baseMax,
+      Math.min(MAX_BASE_ITEMS_PER_WINDOW, Math.floor(Number(this.settings.adaptiveItemCapMax) || 50)),
+    );
+
+    return Math.max(baseMax, Math.min(adaptiveMax, baseMax + feedBonus + topicBonus));
+  }
+
+  getEffectiveMaxItemsPreview(): number {
+    const enabledFeeds = this.settings.feeds.filter((feed) => feed.enabled && feed.url.trim().length > 0);
+    return this.resolveEffectiveMaxItemsPerWindow(enabledFeeds);
   }
 
   async syncFeedsFromRssDashboard(force: boolean, showNotice: boolean): Promise<boolean> {
@@ -1555,7 +1734,7 @@ export default class RssWindowCapturePlugin extends Plugin {
     let itemsFilteredByKeyword = 0;
     let itemsDeduped = 0;
     let itemsFilteredByQuality = 0;
-    const maxItemsPerWindow = ENFORCED_MAX_ITEMS_PER_WINDOW;
+    const maxItemsPerWindow = this.resolveEffectiveMaxItemsPerWindow(feeds);
     let itemLimitHit = false;
     const includeKeywords = parseKeywordList(this.settings.includeKeywords);
     const excludeKeywords = parseKeywordList(this.settings.excludeKeywords);
@@ -1609,7 +1788,7 @@ export default class RssWindowCapturePlugin extends Plugin {
       }
     }
 
-    const rankedRows = windowCandidates
+    const rankedRows: ScoredWindowRow[] = windowCandidates
       .map((row) => ({
         row,
         qualityScore: scoreWindowItemQuality(row.item, windowEnd),
@@ -1626,13 +1805,18 @@ export default class RssWindowCapturePlugin extends Plugin {
         return a.row.item.title.localeCompare(b.row.item.title);
       });
 
-    const selectedRows = rankedRows.slice(0, maxItemsPerWindow).map((entry) => entry.row);
+    const selectedRows = selectRowsWithTopicDiversity(
+      rankedRows,
+      maxItemsPerWindow,
+      this.settings.topicDiversityMinPerTopic,
+      this.settings.topicDiversityPenaltyPerSelected,
+    );
     itemLimitHit = rankedRows.length > selectedRows.length;
     itemsFilteredByQuality = Math.max(0, rankedRows.length - selectedRows.length);
     totalItems = selectedRows.length;
 
     for (const row of selectedRows) {
-      const topic = row.feed.topic.trim() || "Uncategorized";
+      const topic = getRowTopic(row);
       if (!grouped.has(topic)) {
         grouped.set(topic, []);
       }
@@ -1643,6 +1827,7 @@ export default class RssWindowCapturePlugin extends Plugin {
       return {
         notePath: null,
         totalItems,
+        effectiveMaxItemsPerWindow: maxItemsPerWindow,
         feedErrors,
         feedsChecked: feeds.length,
         itemsWithoutDate,
@@ -1667,6 +1852,7 @@ export default class RssWindowCapturePlugin extends Plugin {
       itemsFilteredByKeyword,
       itemsDeduped,
       itemsFilteredByQuality,
+      maxItemsPerWindow,
       feedErrors,
       translationStats,
       itemLimitHit,
@@ -1678,6 +1864,7 @@ export default class RssWindowCapturePlugin extends Plugin {
     return {
       notePath,
       totalItems,
+      effectiveMaxItemsPerWindow: maxItemsPerWindow,
       feedErrors,
       feedsChecked: feeds.length,
       itemsWithoutDate,
@@ -1709,6 +1896,7 @@ export default class RssWindowCapturePlugin extends Plugin {
     itemsFilteredByKeyword: number,
     itemsDeduped: number,
     itemsFilteredByQuality: number,
+    effectiveMaxItemsPerWindow: number,
     feedErrors: string[],
     translationStats: TranslationStats,
     itemLimitHit: boolean,
@@ -1729,7 +1917,9 @@ export default class RssWindowCapturePlugin extends Plugin {
     lines.push(`items_deduped: ${itemsDeduped}`);
     lines.push(`items_filtered_by_quality: ${itemsFilteredByQuality}`);
     lines.push(`feed_errors: ${feedErrors.length}`);
-    lines.push(`max_items_per_window: ${this.settings.maxItemsPerWindow}`);
+    lines.push(`max_items_per_window_base: ${this.settings.maxItemsPerWindow}`);
+    lines.push(`max_items_per_window_effective: ${effectiveMaxItemsPerWindow}`);
+    lines.push(`max_items_per_window: ${effectiveMaxItemsPerWindow}`);
     lines.push(`item_limit_hit: ${itemLimitHit ? "true" : "false"}`);
     lines.push(`translation_provider: "${translationStats.provider}"`);
     if (translationStats.model) {
@@ -1751,11 +1941,16 @@ export default class RssWindowCapturePlugin extends Plugin {
     lines.push(`- Filtered by keywords: ${itemsFilteredByKeyword}`);
     lines.push(`- Deduped: ${itemsDeduped}`);
     lines.push(`- Filtered by quality: ${itemsFilteredByQuality}`);
-    lines.push(`- Max items per window: ${this.settings.maxItemsPerWindow}`);
+    lines.push(`- Max items per window (base/effective): ${this.settings.maxItemsPerWindow} / ${effectiveMaxItemsPerWindow}`);
     lines.push(`- Item limit hit: ${itemLimitHit ? "yes" : "no"}`);
+    lines.push(`- Topic diversity minimum per topic: ${this.settings.topicDiversityMinPerTopic}`);
+    lines.push(`- Topic diversity penalty: ${this.settings.topicDiversityPenaltyPerSelected.toFixed(2)}`);
     lines.push(`- Translation provider: ${translationStats.provider}`);
     lines.push(`- Titles translated: ${translationStats.titlesTranslated}`);
     lines.push(`- Descriptions translated: ${translationStats.descriptionsTranslated}`);
+    if (this.settings.scoreTemplateEnabled) {
+      lines.push(`- Action candidate threshold: ${this.settings.scoreActionThreshold}+`);
+    }
     lines.push("");
 
     const topics = Array.from(grouped.keys()).sort((a, b) => a.localeCompare(b));
@@ -1800,7 +1995,6 @@ export default class RssWindowCapturePlugin extends Plugin {
           lines.push(
             `- Score: Impact ${defaultScore} / Actionability ${defaultScore} / Timing ${defaultScore} / Confidence ${defaultScore} = ${defaultTotalScore}`,
           );
-          lines.push(`- Action candidate threshold: ${this.settings.scoreActionThreshold}+`);
         }
 
         if (this.settings.includeDescription && row.item.description) {
@@ -1977,12 +2171,39 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    const lang: UiLanguage = this.plugin.settings.uiLanguage === "en" ? "en" : "ko";
+    const t = (ko: string, en: string): string => (lang === "ko" ? ko : en);
 
-    containerEl.createEl("h2", { text: "RSS Insight" });
+    containerEl.createEl("h2", { text: t("RSS 인사이트", "RSS Insight") });
 
     new Setting(containerEl)
-      .setName("Auto fetch")
-      .setDesc("Check and run due windows every minute while Obsidian is open.")
+      .setName(t("설정 언어", "Settings language"))
+      .setDesc(
+        t(
+          "설정창 언어를 선택합니다. 한 번에 한 언어만 표시됩니다.",
+          "Choose the settings UI language. Only one language is shown at a time.",
+        ),
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("ko", "한국어")
+          .addOption("en", "English")
+          .setValue(this.plugin.settings.uiLanguage)
+          .onChange(async (value) => {
+            this.plugin.settings.uiLanguage = value === "en" ? "en" : "ko";
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName(t("자동 수집", "Auto fetch"))
+      .setDesc(
+        t(
+          "Obsidian이 열려 있는 동안 매분 수집 대상 윈도우를 확인하고 실행합니다.",
+          "Check and run due windows every minute while Obsidian is open.",
+        ),
+      )
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.autoFetchEnabled).onChange(async (value) => {
           this.plugin.settings.autoFetchEnabled = value;
@@ -1994,8 +2215,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Schedule times")
-      .setDesc("Comma-separated HH:MM values. Example: 08:00,17:00")
+      .setName(t("수집 시간", "Schedule times"))
+      .setDesc(t("쉼표로 구분한 HH:MM 형식. 예: 08:00,17:00", "Comma-separated HH:MM values. Example: 08:00,17:00"))
       .addText((text) =>
         text
           .setPlaceholder("08:00,17:00")
@@ -2008,16 +2229,21 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
 
     const parsedTimes = parseScheduleMinutes(this.plugin.settings.scheduleTimes);
     new Setting(containerEl)
-      .setName("Parsed times")
+      .setName(t("해석된 시간", "Parsed times"))
       .setDesc(
         parsedTimes.length > 0
           ? parsedTimes.map((minutes) => minutesToToken(minutes)).join(", ")
-          : "No valid schedule times",
+          : t("유효한 수집 시간이 없습니다", "No valid schedule times"),
       );
 
     new Setting(containerEl)
-      .setName("Catch up on startup")
-      .setDesc("When Obsidian starts, capture missed windows since the last pointer.")
+      .setName(t("시작 시 누락 보충", "Catch up on startup"))
+      .setDesc(
+        t(
+          "Obsidian 시작 시 마지막 포인터 이후 놓친 윈도우를 보충 수집합니다.",
+          "When Obsidian starts, capture missed windows since the last pointer.",
+        ),
+      )
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.startupCatchupEnabled).onChange(async (value) => {
           this.plugin.settings.startupCatchupEnabled = value;
@@ -2026,8 +2252,13 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Max catch-up windows per run")
-      .setDesc("Safety cap for one run. If missed windows are larger, the next tick keeps catching up.")
+      .setName(t("1회 실행당 최대 보충 윈도우", "Max catch-up windows per run"))
+      .setDesc(
+        t(
+          "한 번 실행에서 처리할 보충 윈도우 상한입니다. 누락이 더 많으면 다음 틱에서 계속 처리합니다.",
+          "Safety cap for one run. If missed windows are larger, the next tick keeps catching up.",
+        ),
+      )
       .addText((text) =>
         text
           .setPlaceholder("10")
@@ -2042,18 +2273,136 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Max items per window")
-      .setDesc("Quality-first fixed cap. RSS Insight always keeps top 20 items per window.")
+      .setName(t("기본 최대 항목 수(윈도우당)", "Base max items per window"))
+      .setDesc(
+        t(
+          "자동 확장 적용 전, 품질 선별의 기본 상한입니다.",
+          "Base target for quality-selected items before adaptive expansion.",
+        ),
+      )
       .addText((text) =>
         text
-          .setPlaceholder(String(ENFORCED_MAX_ITEMS_PER_WINDOW))
-          .setValue(String(ENFORCED_MAX_ITEMS_PER_WINDOW))
-          .setDisabled(true),
+          .setPlaceholder("20")
+          .setValue(String(this.plugin.settings.maxItemsPerWindow))
+          .onChange(async (value) => {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed) && parsed >= MIN_BASE_ITEMS_PER_WINDOW && parsed <= MAX_BASE_ITEMS_PER_WINDOW) {
+              this.plugin.settings.maxItemsPerWindow = Math.floor(parsed);
+              if (this.plugin.settings.adaptiveItemCapMax < this.plugin.settings.maxItemsPerWindow) {
+                this.plugin.settings.adaptiveItemCapMax = this.plugin.settings.maxItemsPerWindow;
+              }
+              await this.plugin.saveSettings();
+              this.display();
+            }
+          }),
       );
 
     new Setting(containerEl)
-      .setName("Output folder")
-      .setDesc("Vault-relative folder where capture notes are written.")
+      .setName(t("최대 항목 자동 확장", "Adaptive max items"))
+      .setDesc(
+        t(
+          "활성 피드/토픽 수에 따라 유효 상한을 자동으로 늘립니다.",
+          "Auto-expand effective cap based on enabled feed/topic count.",
+        ),
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.adaptiveItemCapEnabled).onChange(async (value) => {
+          this.plugin.settings.adaptiveItemCapEnabled = value;
+          await this.plugin.saveSettings();
+          this.display();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName(t("자동 확장 최대치", "Adaptive cap upper bound"))
+      .setDesc(
+        t(
+          "자동 확장을 켰을 때 올라갈 수 있는 최대 상한입니다.",
+          "Maximum effective cap when adaptive mode is enabled.",
+        ),
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("50")
+          .setValue(String(this.plugin.settings.adaptiveItemCapMax))
+          .onChange(async (value) => {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed) && parsed >= this.plugin.settings.maxItemsPerWindow && parsed <= MAX_BASE_ITEMS_PER_WINDOW) {
+              this.plugin.settings.adaptiveItemCapMax = Math.floor(parsed);
+              await this.plugin.saveSettings();
+              this.display();
+            }
+          }),
+      );
+
+    const enabledFeedsForPreview = this.plugin.settings.feeds.filter(
+      (feed) => feed.enabled && feed.url.trim().length > 0,
+    );
+    const topicCountForPreview = new Set(
+      enabledFeedsForPreview.map((feed) => normalizeTopic(feed.topic || "Uncategorized")),
+    ).size;
+    new Setting(containerEl)
+      .setName(t("유효 상한 미리보기", "Effective cap preview"))
+      .setDesc(
+        t(
+          `현재: ${this.plugin.getEffectiveMaxItemsPreview()}개 (활성 피드: ${enabledFeedsForPreview.length}, 토픽: ${topicCountForPreview})`,
+          `Now: ${this.plugin.getEffectiveMaxItemsPreview()} items (enabled feeds: ${enabledFeedsForPreview.length}, topics: ${topicCountForPreview})`,
+        ),
+      );
+
+    new Setting(containerEl)
+      .setName(t("토픽별 최소 확보 개수", "Topic diversity minimum per topic"))
+      .setDesc(
+        t(
+          "가중치 채우기 전에 토픽별로 최소 이 개수만큼 먼저 확보합니다.",
+          "Try to keep at least this many items per topic before weighted fill.",
+        ),
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("1")
+          .setValue(String(this.plugin.settings.topicDiversityMinPerTopic))
+          .onChange(async (value) => {
+            const parsed = Number(value);
+            if (
+              Number.isFinite(parsed)
+              && parsed >= MIN_TOPIC_DIVERSITY_PER_TOPIC
+              && parsed <= MAX_TOPIC_DIVERSITY_PER_TOPIC
+            ) {
+              this.plugin.settings.topicDiversityMinPerTopic = Math.floor(parsed);
+              await this.plugin.saveSettings();
+            }
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName(t("토픽 분산 페널티", "Topic diversity penalty"))
+      .setDesc(
+        t(
+          "값이 높을수록 토픽 분산이 강해집니다. 0이면 순수 품질 순서입니다.",
+          "Higher value spreads topics more aggressively. 0 = pure quality order.",
+        ),
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("1.25")
+          .setValue(String(this.plugin.settings.topicDiversityPenaltyPerSelected))
+          .onChange(async (value) => {
+            const parsed = Number(value);
+            if (
+              Number.isFinite(parsed)
+              && parsed >= MIN_TOPIC_DIVERSITY_PENALTY
+              && parsed <= MAX_TOPIC_DIVERSITY_PENALTY
+            ) {
+              this.plugin.settings.topicDiversityPenaltyPerSelected = Math.round(parsed * 100) / 100;
+              await this.plugin.saveSettings();
+            }
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName(t("출력 폴더", "Output folder"))
+      .setDesc(t("수집 노트를 저장할 Vault 기준 폴더입니다.", "Vault-relative folder where capture notes are written."))
       .addText((text) =>
         text
           .setPlaceholder("000-Inbox/RSS")
@@ -2065,8 +2414,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Filename prefix")
-      .setDesc("Prefix used for generated note filenames.")
+      .setName(t("파일명 접두어", "Filename prefix"))
+      .setDesc(t("생성되는 노트 파일명 앞부분입니다.", "Prefix used for generated note filenames."))
       .addText((text) =>
         text
           .setPlaceholder("rss-capture")
@@ -2078,8 +2427,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Include description")
-      .setDesc("Add feed description/summary text under each item.")
+      .setName(t("설명 포함", "Include description"))
+      .setDesc(t("각 기사 아래에 feed description/summary를 함께 기록합니다.", "Add feed description/summary text under each item."))
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.includeDescription).onChange(async (value) => {
           this.plugin.settings.includeDescription = value;
@@ -2088,8 +2437,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Description max length")
-      .setDesc("Maximum characters for each description block.")
+      .setName(t("설명 최대 길이", "Description max length"))
+      .setDesc(t("각 설명 블록의 최대 글자 수입니다.", "Maximum characters for each description block."))
       .addText((text) =>
         text
           .setPlaceholder("500")
@@ -2104,8 +2453,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Write empty notes")
-      .setDesc("If enabled, create a note even when no items are found.")
+      .setName(t("빈 노트도 생성", "Write empty notes"))
+      .setDesc(t("결과가 없어도 리포트 노트를 생성합니다.", "If enabled, create a note even when no items are found."))
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.writeEmptyNote).onChange(async (value) => {
           this.plugin.settings.writeEmptyNote = value;
@@ -2113,11 +2462,11 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
         }),
       );
 
-    containerEl.createEl("h3", { text: "Translation" });
+    containerEl.createEl("h3", { text: t("번역", "Translation") });
 
     new Setting(containerEl)
-      .setName("Enable translation")
-      .setDesc("Translate non-Korean items while writing notes.")
+      .setName(t("번역 사용", "Enable translation"))
+      .setDesc(t("노트 작성 시 비한글 항목을 자동 번역합니다.", "Translate non-Korean items while writing notes."))
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.translationEnabled).onChange(async (value) => {
           this.plugin.settings.translationEnabled = value;
@@ -2127,13 +2476,18 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Translation provider")
-      .setDesc("Web mode works without local AI. Ollama mode uses local model you choose.")
+      .setName(t("번역 제공자", "Translation provider"))
+      .setDesc(
+        t(
+          "웹 번역은 로컬 AI 없이 동작합니다. Ollama는 선택한 로컬 모델을 사용합니다.",
+          "Web mode works without local AI. Ollama mode uses local model you choose.",
+        ),
+      )
       .addDropdown((dropdown) =>
         dropdown
-          .addOption("web", "Web translate (no local AI)")
-          .addOption("ollama", "Local Ollama")
-          .addOption("none", "Disabled")
+          .addOption("web", t("웹 번역(로컬 AI 없음)", "Web translate (no local AI)"))
+          .addOption("ollama", t("로컬 Ollama", "Local Ollama"))
+          .addOption("none", t("사용 안 함", "Disabled"))
           .setValue(this.plugin.settings.translationProvider)
           .onChange(async (value) => {
             this.plugin.settings.translationProvider =
@@ -2144,8 +2498,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Target language")
-      .setDesc("ISO code like ko, en, ja.")
+      .setName(t("대상 언어", "Target language"))
+      .setDesc(t("ko, en, ja 같은 ISO 코드.", "ISO code like ko, en, ja."))
       .addText((text) =>
         text
           .setPlaceholder("ko")
@@ -2160,8 +2514,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Translate only non-Korean")
-      .setDesc("If enabled, text already containing Hangul is skipped.")
+      .setName(t("비한글만 번역", "Translate only non-Korean"))
+      .setDesc(t("한글이 포함된 텍스트는 번역하지 않습니다.", "If enabled, text already containing Hangul is skipped."))
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.translationOnlyNonKorean)
@@ -2172,8 +2526,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Keep original text")
-      .setDesc("When translation is added, keep original description below it.")
+      .setName(t("원문 유지", "Keep original text"))
+      .setDesc(t("번역을 추가할 때 원문 설명을 아래에 함께 유지합니다.", "When translation is added, keep original description below it."))
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.translationKeepOriginal).onChange(async (value) => {
           this.plugin.settings.translationKeepOriginal = value;
@@ -2182,8 +2536,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Translate title")
-      .setDesc("Translate item titles.")
+      .setName(t("제목 번역", "Translate title"))
+      .setDesc(t("기사 제목을 번역합니다.", "Translate item titles."))
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.translationTranslateTitle).onChange(async (value) => {
           this.plugin.settings.translationTranslateTitle = value;
@@ -2192,8 +2546,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Translate description")
-      .setDesc("Translate description/summary blocks.")
+      .setName(t("설명 번역", "Translate description"))
+      .setDesc(t("description/summary 블록을 번역합니다.", "Translate description/summary blocks."))
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.translationTranslateDescription)
@@ -2205,8 +2559,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
 
     if (this.plugin.settings.translationProvider === "web") {
       new Setting(containerEl)
-        .setName("Web translation endpoint")
-        .setDesc("Default endpoint usually works without API key.")
+        .setName(t("웹 번역 엔드포인트", "Web translation endpoint"))
+        .setDesc(t("기본 엔드포인트는 보통 API 키 없이 동작합니다.", "Default endpoint usually works without API key."))
         .addText((text) =>
           text
             .setPlaceholder("https://translate.googleapis.com/translate_a/single")
@@ -2223,8 +2577,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
 
     if (this.plugin.settings.translationProvider === "ollama") {
       new Setting(containerEl)
-        .setName("Ollama base URL")
-        .setDesc("Example: http://127.0.0.1:11434")
+        .setName(t("Ollama 기본 URL", "Ollama base URL"))
+        .setDesc(t("예시: http://127.0.0.1:11434", "Example: http://127.0.0.1:11434"))
         .addText((text) =>
           text
             .setPlaceholder("http://127.0.0.1:11434")
@@ -2241,15 +2595,18 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       const modelOptions = this.plugin.getOllamaModelOptionsForUi();
       const recommendedModel = this.plugin.getRecommendedOllamaModelForUi();
       const modelDescription = recommendedModel
-        ? `Detected: ${modelOptions.length} / Recommended: ${recommendedModel}`
-        : "No detected models yet. Click refresh first.";
+        ? t(
+            `탐지됨: ${modelOptions.length} / 추천: ${recommendedModel}`,
+            `Detected: ${modelOptions.length} / Recommended: ${recommendedModel}`,
+          )
+        : t("탐지된 모델이 없습니다. 먼저 새로고침하세요.", "No detected models yet. Click refresh first.");
 
       new Setting(containerEl)
-        .setName("Ollama model")
+        .setName(t("Ollama 모델", "Ollama model"))
         .setDesc(modelDescription)
         .addDropdown((dropdown) => {
           if (modelOptions.length === 0) {
-            dropdown.addOption("", "(refresh models first)");
+            dropdown.addOption("", t("(먼저 모델 새로고침)", "(refresh models first)"));
           } else {
             for (const model of modelOptions) {
               dropdown.addOption(model, model);
@@ -2265,22 +2622,22 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
           return dropdown;
         })
         .addButton((button) =>
-          button.setButtonText("Refresh models").onClick(async () => {
+          button.setButtonText(t("모델 새로고침", "Refresh models")).onClick(async () => {
             await this.plugin.refreshOllamaModels(true);
             this.display();
           }),
         );
 
       new Setting(containerEl)
-        .setName("Last model refresh")
-        .setDesc(this.plugin.settings.ollamaLastModelRefreshIso || "Not refreshed yet");
+        .setName(t("마지막 모델 새로고침", "Last model refresh"))
+        .setDesc(this.plugin.settings.ollamaLastModelRefreshIso || t("아직 새로고침 안 됨", "Not refreshed yet"));
     }
 
-    containerEl.createEl("h3", { text: "Filtering, Dedupe, Scoring" });
+    containerEl.createEl("h3", { text: t("필터링 · 중복제거 · 점수", "Filtering, Dedupe, Scoring") });
 
     new Setting(containerEl)
-      .setName("Enhanced dedupe")
-      .setDesc("Deduplicate across feeds using normalized link/title.")
+      .setName(t("고급 중복 제거", "Enhanced dedupe"))
+      .setDesc(t("정규화된 링크/제목을 사용해 피드 간 중복을 제거합니다.", "Deduplicate across feeds using normalized link/title."))
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.enhancedDedupeEnabled).onChange(async (value) => {
           this.plugin.settings.enhancedDedupeEnabled = value;
@@ -2289,8 +2646,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Keyword filter")
-      .setDesc("Apply include/exclude keyword filter to collected items.")
+      .setName(t("키워드 필터", "Keyword filter"))
+      .setDesc(t("수집 항목에 포함/제외 키워드 필터를 적용합니다.", "Apply include/exclude keyword filter to collected items."))
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.keywordFilterEnabled).onChange(async (value) => {
           this.plugin.settings.keywordFilterEnabled = value;
@@ -2299,8 +2656,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Include keywords")
-      .setDesc("Comma or newline separated. Match any keyword.")
+      .setName(t("포함 키워드", "Include keywords"))
+      .setDesc(t("쉼표 또는 줄바꿈으로 구분. 하나라도 매칭되면 통과.", "Comma or newline separated. Match any keyword."))
       .addTextArea((text) =>
         text.setPlaceholder("ai, bitcoin, fed")
           .setValue(this.plugin.settings.includeKeywords)
@@ -2311,8 +2668,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Exclude keywords")
-      .setDesc("Comma or newline separated. Exclude if matched.")
+      .setName(t("제외 키워드", "Exclude keywords"))
+      .setDesc(t("쉼표 또는 줄바꿈으로 구분. 매칭되면 제외.", "Comma or newline separated. Exclude if matched."))
       .addTextArea((text) =>
         text.setPlaceholder("sponsored, advertisement")
           .setValue(this.plugin.settings.excludeKeywords)
@@ -2323,8 +2680,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Score template")
-      .setDesc("Add default 4-factor score lines under each item.")
+      .setName(t("점수 템플릿", "Score template"))
+      .setDesc(t("각 기사 아래에 기본 4요소 점수 라인을 추가합니다.", "Add default 4-factor score lines under each item."))
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.scoreTemplateEnabled).onChange(async (value) => {
           this.plugin.settings.scoreTemplateEnabled = value;
@@ -2333,8 +2690,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Default score value")
-      .setDesc("Default value for Impact/Actionability/Timing/Confidence (1-5).")
+      .setName(t("기본 점수값", "Default score value"))
+      .setDesc(t("Impact/Actionability/Timing/Confidence의 기본값(1-5).", "Default value for Impact/Actionability/Timing/Confidence (1-5)."))
       .addText((text) =>
         text
           .setPlaceholder("3")
@@ -2349,8 +2706,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Action threshold")
-      .setDesc("Score total threshold reference for action candidates.")
+      .setName(t("액션 임계값", "Action threshold"))
+      .setDesc(t("액션 후보 판단용 총점 기준값입니다.", "Score total threshold reference for action candidates."))
       .addText((text) =>
         text
           .setPlaceholder("14")
@@ -2365,21 +2722,21 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Last window pointer")
-      .setDesc(this.plugin.settings.lastWindowEndIso || "Not set yet")
+      .setName(t("마지막 윈도우 포인터", "Last window pointer"))
+      .setDesc(this.plugin.settings.lastWindowEndIso || t("아직 설정되지 않음", "Not set yet"))
       .addButton((button) =>
-        button.setButtonText("Reset").onClick(async () => {
+        button.setButtonText(t("초기화", "Reset")).onClick(async () => {
           this.plugin.settings.lastWindowEndIso = "";
           await this.plugin.saveSettings();
           this.display();
         }),
       );
 
-    containerEl.createEl("h3", { text: "RSS Dashboard Sync" });
+    containerEl.createEl("h3", { text: t("RSS Dashboard 동기화", "RSS Dashboard Sync") });
 
     new Setting(containerEl)
-      .setName("Enable RSS Dashboard sync")
-      .setDesc("Auto-import feed list from RSS Dashboard data.json.")
+      .setName(t("RSS Dashboard 동기화 사용", "Enable RSS Dashboard sync"))
+      .setDesc(t("RSS Dashboard data.json의 피드 목록을 자동 가져옵니다.", "Auto-import feed list from RSS Dashboard data.json."))
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.rssDashboardSyncEnabled).onChange(async (value) => {
           this.plugin.settings.rssDashboardSyncEnabled = value;
@@ -2388,8 +2745,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("RSS Dashboard data path")
-      .setDesc("Vault-relative path to RSS Dashboard settings file.")
+      .setName(t("RSS Dashboard 데이터 경로", "RSS Dashboard data path"))
+      .setDesc(t("RSS Dashboard 설정 파일의 Vault 기준 경로입니다.", "Vault-relative path to RSS Dashboard settings file."))
       .addText((text) =>
         text
           .setPlaceholder(".obsidian/plugins/rss-dashboard/data.json")
@@ -2405,26 +2762,29 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
       (feed) => feed.source === "rss-dashboard",
     ).length;
     const syncStatus = this.plugin.settings.rssDashboardLastSyncAtIso
-      ? `Last sync: ${this.plugin.settings.rssDashboardLastSyncAtIso} / synced feeds: ${syncedFeedCount}`
-      : `No sync yet / synced feeds: ${syncedFeedCount}`;
+      ? t(
+          `마지막 동기화: ${this.plugin.settings.rssDashboardLastSyncAtIso} / 동기화 피드: ${syncedFeedCount}`,
+          `Last sync: ${this.plugin.settings.rssDashboardLastSyncAtIso} / synced feeds: ${syncedFeedCount}`,
+        )
+      : t(`아직 동기화 안 됨 / 동기화 피드: ${syncedFeedCount}`, `No sync yet / synced feeds: ${syncedFeedCount}`);
 
     new Setting(containerEl)
-      .setName("Dashboard sync status")
+      .setName(t("동기화 상태", "Dashboard sync status"))
       .setDesc(syncStatus)
       .addButton((button) =>
-        button.setButtonText("Sync now").onClick(async () => {
+        button.setButtonText(t("지금 동기화", "Sync now")).onClick(async () => {
           await this.plugin.syncFeedsFromRssDashboard(true, true);
           this.display();
         }),
       );
 
-    containerEl.createEl("h3", { text: "Feeds" });
+    containerEl.createEl("h3", { text: t("피드 목록", "Feeds") });
 
     new Setting(containerEl)
-      .setName("Add feed")
-      .setDesc("Add an RSS/Atom feed with a topic label.")
+      .setName(t("피드 추가", "Add feed"))
+      .setDesc(t("토픽 라벨과 함께 RSS/Atom 피드를 추가합니다.", "Add an RSS/Atom feed with a topic label."))
       .addButton((button) =>
-        button.setButtonText("Add").onClick(async () => {
+        button.setButtonText(t("추가", "Add")).onClick(async () => {
           this.plugin.settings.feeds.push({
             id: createFeedId(),
             topic: "AI",
@@ -2440,18 +2800,20 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
 
     if (this.plugin.settings.feeds.length === 0) {
       containerEl.createEl("p", {
-        text: "No feeds configured yet. Add at least one feed to start capturing.",
+        text: t("아직 피드가 없습니다. 수집을 시작하려면 최소 1개 피드를 추가하세요.", "No feeds configured yet. Add at least one feed to start capturing."),
       });
       return;
     }
 
     this.plugin.settings.feeds.forEach((feed, index) => {
       const row = containerEl.createDiv({ cls: "rss-insight-feed-row" });
-      const sourceLabel = feed.source === "rss-dashboard" ? "RSS Dashboard sync" : "Manual";
+      const sourceLabel = feed.source === "rss-dashboard"
+        ? t("RSS Dashboard 동기화", "RSS Dashboard sync")
+        : t("수동", "Manual");
 
       new Setting(row)
-        .setName(`Feed ${index + 1}`)
-        .setDesc(`${sourceLabel} / Enable or remove this feed.`)
+        .setName(`${t("피드", "Feed")} ${index + 1}`)
+        .setDesc(`${sourceLabel} / ${t("이 피드를 켜거나 삭제할 수 있습니다.", "Enable or remove this feed.")}`)
         .addToggle((toggle) =>
           toggle.setValue(feed.enabled).onChange(async (value) => {
             feed.enabled = value;
@@ -2459,7 +2821,7 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
           }),
         )
         .addExtraButton((button) =>
-          button.setIcon("trash").setTooltip("Delete feed").onClick(async () => {
+          button.setIcon("trash").setTooltip(t("피드 삭제", "Delete feed")).onClick(async () => {
             this.plugin.settings.feeds = this.plugin.settings.feeds.filter(
               (candidate) => candidate.id !== feed.id,
             );
@@ -2469,8 +2831,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
         );
 
       new Setting(row)
-        .setName("Topic")
-        .setDesc("Used as section heading in output notes.")
+        .setName(t("토픽", "Topic"))
+        .setDesc(t("출력 노트의 섹션 제목으로 사용됩니다.", "Used as section heading in output notes."))
         .addText((text) =>
           text.setValue(feed.topic).onChange(async (value) => {
             feed.topic = normalizeTopic(value);
@@ -2479,8 +2841,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
         );
 
       new Setting(row)
-        .setName("Feed name")
-        .setDesc("Display name for this source.")
+        .setName(t("피드 이름", "Feed name"))
+        .setDesc(t("이 소스의 표시 이름입니다.", "Display name for this source."))
         .addText((text) =>
           text.setValue(feed.name).onChange(async (value) => {
             feed.name = value.trim();
@@ -2489,8 +2851,8 @@ class RssWindowCaptureSettingTab extends PluginSettingTab {
         );
 
       new Setting(row)
-        .setName("Feed URL")
-        .setDesc("RSS or Atom URL.")
+        .setName(t("피드 URL", "Feed URL"))
+        .setDesc(t("RSS 또는 Atom URL.", "RSS or Atom URL."))
         .addText((text) =>
           text
             .setPlaceholder("https://example.com/rss")

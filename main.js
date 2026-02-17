@@ -25,6 +25,7 @@ __export(main_exports, {
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
 var DEFAULT_SETTINGS = {
+  uiLanguage: "ko",
   autoFetchEnabled: true,
   scheduleTimes: "08:00,17:00",
   outputFolder: "000-Inbox/RSS",
@@ -47,6 +48,10 @@ var DEFAULT_SETTINGS = {
   startupCatchupEnabled: true,
   maxCatchupWindowsPerRun: 10,
   maxItemsPerWindow: 20,
+  adaptiveItemCapEnabled: true,
+  adaptiveItemCapMax: 50,
+  topicDiversityMinPerTopic: 1,
+  topicDiversityPenaltyPerSelected: 1.25,
   translationEnabled: false,
   translationProvider: "web",
   translationTargetLanguage: "ko",
@@ -65,7 +70,12 @@ var SCHEDULER_TICK_MS = 60 * 1e3;
 var MAX_TRANSLATION_INPUT_LENGTH = 2e3;
 var TRANSLATED_DESCRIPTION_MAX_LENGTH = 300;
 var MAX_DESCRIPTION_ENRICH_ITEMS_PER_WINDOW = 40;
-var ENFORCED_MAX_ITEMS_PER_WINDOW = 20;
+var MIN_BASE_ITEMS_PER_WINDOW = 10;
+var MAX_BASE_ITEMS_PER_WINDOW = 250;
+var MIN_TOPIC_DIVERSITY_PER_TOPIC = 0;
+var MAX_TOPIC_DIVERSITY_PER_TOPIC = 3;
+var MIN_TOPIC_DIVERSITY_PENALTY = 0;
+var MAX_TOPIC_DIVERSITY_PENALTY = 5;
 var TRACKING_QUERY_KEYS = /* @__PURE__ */ new Set([
   "utm_source",
   "utm_medium",
@@ -283,6 +293,87 @@ function scoreWindowItemQuality(item, windowEnd) {
     score -= 4;
   }
   return score;
+}
+function getRowTopic(row) {
+  return row.feed.topic.trim() || "Uncategorized";
+}
+function selectRowsWithTopicDiversity(rankedRows, limit, minPerTopic, penaltyPerSelected) {
+  var _a, _b, _c, _d;
+  if (limit <= 0 || rankedRows.length === 0) {
+    return [];
+  }
+  const perTopic = /* @__PURE__ */ new Map();
+  for (const entry of rankedRows) {
+    const topic = getRowTopic(entry.row);
+    if (!perTopic.has(topic)) {
+      perTopic.set(topic, []);
+    }
+    (_a = perTopic.get(topic)) == null ? void 0 : _a.push(entry);
+  }
+  const selected = [];
+  const selectedByTopic = /* @__PURE__ */ new Map();
+  const sortedTopicsByTopScore = () => Array.from(perTopic.entries()).filter(([, queue]) => queue.length > 0).sort((a, b) => {
+    var _a2, _b2, _c2, _d2;
+    const aTop = (_b2 = (_a2 = a[1][0]) == null ? void 0 : _a2.qualityScore) != null ? _b2 : Number.NEGATIVE_INFINITY;
+    const bTop = (_d2 = (_c2 = b[1][0]) == null ? void 0 : _c2.qualityScore) != null ? _d2 : Number.NEGATIVE_INFINITY;
+    if (aTop !== bTop) {
+      return bTop - aTop;
+    }
+    return a[0].localeCompare(b[0]);
+  }).map(([topic]) => topic);
+  const takeTopFromTopic = (topic) => {
+    var _a2;
+    const queue = perTopic.get(topic);
+    if (!queue || queue.length === 0) {
+      return false;
+    }
+    const entry = queue.shift();
+    if (!entry) {
+      return false;
+    }
+    selected.push(entry.row);
+    selectedByTopic.set(topic, ((_a2 = selectedByTopic.get(topic)) != null ? _a2 : 0) + 1);
+    return true;
+  };
+  for (let pass = 0; pass < minPerTopic; pass += 1) {
+    const topicsInPass = sortedTopicsByTopScore();
+    if (topicsInPass.length === 0) {
+      break;
+    }
+    for (const topic of topicsInPass) {
+      if (!takeTopFromTopic(topic)) {
+        continue;
+      }
+      if (selected.length >= limit) {
+        return selected;
+      }
+    }
+  }
+  while (selected.length < limit) {
+    let bestTopic = "";
+    let bestAdjustedScore = Number.NEGATIVE_INFINITY;
+    let bestRawScore = Number.NEGATIVE_INFINITY;
+    for (const [topic, queue] of perTopic.entries()) {
+      if (queue.length === 0) {
+        continue;
+      }
+      const rawScore = (_c = (_b = queue[0]) == null ? void 0 : _b.qualityScore) != null ? _c : Number.NEGATIVE_INFINITY;
+      const selectedCount = (_d = selectedByTopic.get(topic)) != null ? _d : 0;
+      const adjustedScore = rawScore - selectedCount * penaltyPerSelected;
+      if (adjustedScore > bestAdjustedScore || adjustedScore === bestAdjustedScore && rawScore > bestRawScore || adjustedScore === bestAdjustedScore && rawScore === bestRawScore && topic < bestTopic) {
+        bestTopic = topic;
+        bestAdjustedScore = adjustedScore;
+        bestRawScore = rawScore;
+      }
+    }
+    if (!bestTopic) {
+      break;
+    }
+    if (!takeTopFromTopic(bestTopic)) {
+      break;
+    }
+  }
+  return selected;
 }
 function pad2(value) {
   return String(value).padStart(2, "0");
@@ -589,6 +680,7 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
   async loadSettings() {
     const loaded = await this.loadData();
     this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
+    this.settings.uiLanguage = this.settings.uiLanguage === "en" ? "en" : "ko";
     this.settings.feeds = (this.settings.feeds || []).map((feed) => ({
       id: feed.id || createFeedId(),
       topic: normalizeTopic(feed.topic || "Uncategorized"),
@@ -612,7 +704,30 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
       1,
       Math.min(100, Math.floor(Number(this.settings.maxCatchupWindowsPerRun) || 10))
     );
-    this.settings.maxItemsPerWindow = ENFORCED_MAX_ITEMS_PER_WINDOW;
+    this.settings.maxItemsPerWindow = Math.max(
+      MIN_BASE_ITEMS_PER_WINDOW,
+      Math.min(MAX_BASE_ITEMS_PER_WINDOW, Math.floor(Number(this.settings.maxItemsPerWindow) || 20))
+    );
+    this.settings.adaptiveItemCapEnabled = this.settings.adaptiveItemCapEnabled !== false;
+    this.settings.adaptiveItemCapMax = Math.max(
+      this.settings.maxItemsPerWindow,
+      Math.min(MAX_BASE_ITEMS_PER_WINDOW, Math.floor(Number(this.settings.adaptiveItemCapMax) || 50))
+    );
+    const parsedTopicMin = Number(this.settings.topicDiversityMinPerTopic);
+    const safeTopicMin = Number.isFinite(parsedTopicMin) ? parsedTopicMin : 1;
+    this.settings.topicDiversityMinPerTopic = Math.max(
+      MIN_TOPIC_DIVERSITY_PER_TOPIC,
+      Math.min(MAX_TOPIC_DIVERSITY_PER_TOPIC, Math.floor(safeTopicMin))
+    );
+    const parsedDiversityPenalty = Number(this.settings.topicDiversityPenaltyPerSelected);
+    const safeDiversityPenalty = Number.isFinite(parsedDiversityPenalty) ? parsedDiversityPenalty : 1.25;
+    this.settings.topicDiversityPenaltyPerSelected = Math.max(
+      MIN_TOPIC_DIVERSITY_PENALTY,
+      Math.min(
+        MAX_TOPIC_DIVERSITY_PENALTY,
+        Math.round(safeDiversityPenalty * 100) / 100
+      )
+    );
     this.settings.translationProvider = this.normalizeTranslationProvider(
       this.settings.translationProvider
     );
@@ -626,6 +741,30 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
   }
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+  resolveEffectiveMaxItemsPerWindow(feeds) {
+    const baseMax = Math.max(
+      MIN_BASE_ITEMS_PER_WINDOW,
+      Math.min(MAX_BASE_ITEMS_PER_WINDOW, Math.floor(Number(this.settings.maxItemsPerWindow) || 20))
+    );
+    if (!this.settings.adaptiveItemCapEnabled) {
+      return baseMax;
+    }
+    const enabledFeeds = feeds.filter((feed) => feed.enabled && feed.url.trim().length > 0);
+    const topicCount = new Set(
+      enabledFeeds.map((feed) => normalizeTopic(feed.topic || "Uncategorized"))
+    ).size;
+    const feedBonus = Math.floor(enabledFeeds.length / 3);
+    const topicBonus = Math.floor(topicCount / 2);
+    const adaptiveMax = Math.max(
+      baseMax,
+      Math.min(MAX_BASE_ITEMS_PER_WINDOW, Math.floor(Number(this.settings.adaptiveItemCapMax) || 50))
+    );
+    return Math.max(baseMax, Math.min(adaptiveMax, baseMax + feedBonus + topicBonus));
+  }
+  getEffectiveMaxItemsPreview() {
+    const enabledFeeds = this.settings.feeds.filter((feed) => feed.enabled && feed.url.trim().length > 0);
+    return this.resolveEffectiveMaxItemsPerWindow(enabledFeeds);
   }
   async syncFeedsFromRssDashboard(force, showNotice) {
     var _a, _b, _c;
@@ -1209,7 +1348,7 @@ var RssWindowCapturePlugin = class extends import_obsidian.Plugin {
     let itemsFilteredByKeyword = 0;
     let itemsDeduped = 0;
     let itemsFilteredByQuality = 0;
-    const maxItemsPerWindow = ENFORCED_MAX_ITEMS_PER_WINDOW;
+    const maxItemsPerWindow = this.resolveEffectiveMaxItemsPerWindow(feeds);
     let itemLimitHit = false;
     const includeKeywords = parseKeywordList(this.settings.includeKeywords);
     const excludeKeywords = parseKeywordList(this.settings.excludeKeywords);
@@ -1271,12 +1410,17 @@ ${feed.topic}`
       }
       return a.row.item.title.localeCompare(b.row.item.title);
     });
-    const selectedRows = rankedRows.slice(0, maxItemsPerWindow).map((entry) => entry.row);
+    const selectedRows = selectRowsWithTopicDiversity(
+      rankedRows,
+      maxItemsPerWindow,
+      this.settings.topicDiversityMinPerTopic,
+      this.settings.topicDiversityPenaltyPerSelected
+    );
     itemLimitHit = rankedRows.length > selectedRows.length;
     itemsFilteredByQuality = Math.max(0, rankedRows.length - selectedRows.length);
     totalItems = selectedRows.length;
     for (const row of selectedRows) {
-      const topic = row.feed.topic.trim() || "Uncategorized";
+      const topic = getRowTopic(row);
       if (!grouped.has(topic)) {
         grouped.set(topic, []);
       }
@@ -1286,6 +1430,7 @@ ${feed.topic}`
       return {
         notePath: null,
         totalItems,
+        effectiveMaxItemsPerWindow: maxItemsPerWindow,
         feedErrors,
         feedsChecked: feeds.length,
         itemsWithoutDate,
@@ -1308,6 +1453,7 @@ ${feed.topic}`
       itemsFilteredByKeyword,
       itemsDeduped,
       itemsFilteredByQuality,
+      maxItemsPerWindow,
       feedErrors,
       translationStats,
       itemLimitHit
@@ -1317,6 +1463,7 @@ ${feed.topic}`
     return {
       notePath,
       totalItems,
+      effectiveMaxItemsPerWindow: maxItemsPerWindow,
       feedErrors,
       feedsChecked: feeds.length,
       itemsWithoutDate,
@@ -1335,7 +1482,7 @@ ${feed.topic}`
   resolveOutputFolder() {
     return (0, import_obsidian.normalizePath)(this.settings.outputFolder.trim() || DEFAULT_SETTINGS.outputFolder);
   }
-  buildNoteContent(windowStart, windowEnd, grouped, feedsChecked, totalItems, itemsWithoutDate, itemsFilteredByKeyword, itemsDeduped, itemsFilteredByQuality, feedErrors, translationStats, itemLimitHit) {
+  buildNoteContent(windowStart, windowEnd, grouped, feedsChecked, totalItems, itemsWithoutDate, itemsFilteredByKeyword, itemsDeduped, itemsFilteredByQuality, effectiveMaxItemsPerWindow, feedErrors, translationStats, itemLimitHit) {
     var _a;
     const lines = [];
     const defaultScore = this.settings.scoreDefaultValue;
@@ -1352,7 +1499,9 @@ ${feed.topic}`
     lines.push(`items_deduped: ${itemsDeduped}`);
     lines.push(`items_filtered_by_quality: ${itemsFilteredByQuality}`);
     lines.push(`feed_errors: ${feedErrors.length}`);
-    lines.push(`max_items_per_window: ${this.settings.maxItemsPerWindow}`);
+    lines.push(`max_items_per_window_base: ${this.settings.maxItemsPerWindow}`);
+    lines.push(`max_items_per_window_effective: ${effectiveMaxItemsPerWindow}`);
+    lines.push(`max_items_per_window: ${effectiveMaxItemsPerWindow}`);
     lines.push(`item_limit_hit: ${itemLimitHit ? "true" : "false"}`);
     lines.push(`translation_provider: "${translationStats.provider}"`);
     if (translationStats.model) {
@@ -1373,11 +1522,16 @@ ${feed.topic}`
     lines.push(`- Filtered by keywords: ${itemsFilteredByKeyword}`);
     lines.push(`- Deduped: ${itemsDeduped}`);
     lines.push(`- Filtered by quality: ${itemsFilteredByQuality}`);
-    lines.push(`- Max items per window: ${this.settings.maxItemsPerWindow}`);
+    lines.push(`- Max items per window (base/effective): ${this.settings.maxItemsPerWindow} / ${effectiveMaxItemsPerWindow}`);
     lines.push(`- Item limit hit: ${itemLimitHit ? "yes" : "no"}`);
+    lines.push(`- Topic diversity minimum per topic: ${this.settings.topicDiversityMinPerTopic}`);
+    lines.push(`- Topic diversity penalty: ${this.settings.topicDiversityPenaltyPerSelected.toFixed(2)}`);
     lines.push(`- Translation provider: ${translationStats.provider}`);
     lines.push(`- Titles translated: ${translationStats.titlesTranslated}`);
     lines.push(`- Descriptions translated: ${translationStats.descriptionsTranslated}`);
+    if (this.settings.scoreTemplateEnabled) {
+      lines.push(`- Action candidate threshold: ${this.settings.scoreActionThreshold}+`);
+    }
     lines.push("");
     const topics = Array.from(grouped.keys()).sort((a, b) => a.localeCompare(b));
     if (topics.length === 0) {
@@ -1413,7 +1567,6 @@ ${feed.topic}`
           lines.push(
             `- Score: Impact ${defaultScore} / Actionability ${defaultScore} / Timing ${defaultScore} / Confidence ${defaultScore} = ${defaultTotalScore}`
           );
-          lines.push(`- Action candidate threshold: ${this.settings.scoreActionThreshold}+`);
         }
         if (this.settings.includeDescription && row.item.description) {
           const hasTranslatedDescription = !!row.translatedDescription && normalizePlainText(row.translatedDescription) !== normalizePlainText(row.item.description);
@@ -1560,8 +1713,27 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "RSS Insight" });
-    new import_obsidian.Setting(containerEl).setName("Auto fetch").setDesc("Check and run due windows every minute while Obsidian is open.").addToggle(
+    const lang = this.plugin.settings.uiLanguage === "en" ? "en" : "ko";
+    const t = (ko, en) => lang === "ko" ? ko : en;
+    containerEl.createEl("h2", { text: t("RSS \uC778\uC0AC\uC774\uD2B8", "RSS Insight") });
+    new import_obsidian.Setting(containerEl).setName(t("\uC124\uC815 \uC5B8\uC5B4", "Settings language")).setDesc(
+      t(
+        "\uC124\uC815\uCC3D \uC5B8\uC5B4\uB97C \uC120\uD0DD\uD569\uB2C8\uB2E4. \uD55C \uBC88\uC5D0 \uD55C \uC5B8\uC5B4\uB9CC \uD45C\uC2DC\uB429\uB2C8\uB2E4.",
+        "Choose the settings UI language. Only one language is shown at a time."
+      )
+    ).addDropdown(
+      (dropdown) => dropdown.addOption("ko", "\uD55C\uAD6D\uC5B4").addOption("en", "English").setValue(this.plugin.settings.uiLanguage).onChange(async (value) => {
+        this.plugin.settings.uiLanguage = value === "en" ? "en" : "ko";
+        await this.plugin.saveSettings();
+        this.display();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName(t("\uC790\uB3D9 \uC218\uC9D1", "Auto fetch")).setDesc(
+      t(
+        "Obsidian\uC774 \uC5F4\uB824 \uC788\uB294 \uB3D9\uC548 \uB9E4\uBD84 \uC218\uC9D1 \uB300\uC0C1 \uC708\uB3C4\uC6B0\uB97C \uD655\uC778\uD558\uACE0 \uC2E4\uD589\uD569\uB2C8\uB2E4.",
+        "Check and run due windows every minute while Obsidian is open."
+      )
+    ).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.autoFetchEnabled).onChange(async (value) => {
         this.plugin.settings.autoFetchEnabled = value;
         await this.plugin.saveSettings();
@@ -1570,23 +1742,33 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
         }
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Schedule times").setDesc("Comma-separated HH:MM values. Example: 08:00,17:00").addText(
+    new import_obsidian.Setting(containerEl).setName(t("\uC218\uC9D1 \uC2DC\uAC04", "Schedule times")).setDesc(t("\uC27C\uD45C\uB85C \uAD6C\uBD84\uD55C HH:MM \uD615\uC2DD. \uC608: 08:00,17:00", "Comma-separated HH:MM values. Example: 08:00,17:00")).addText(
       (text) => text.setPlaceholder("08:00,17:00").setValue(this.plugin.settings.scheduleTimes).onChange(async (value) => {
         this.plugin.settings.scheduleTimes = value;
         await this.plugin.saveSettings();
       })
     );
     const parsedTimes = parseScheduleMinutes(this.plugin.settings.scheduleTimes);
-    new import_obsidian.Setting(containerEl).setName("Parsed times").setDesc(
-      parsedTimes.length > 0 ? parsedTimes.map((minutes) => minutesToToken(minutes)).join(", ") : "No valid schedule times"
+    new import_obsidian.Setting(containerEl).setName(t("\uD574\uC11D\uB41C \uC2DC\uAC04", "Parsed times")).setDesc(
+      parsedTimes.length > 0 ? parsedTimes.map((minutes) => minutesToToken(minutes)).join(", ") : t("\uC720\uD6A8\uD55C \uC218\uC9D1 \uC2DC\uAC04\uC774 \uC5C6\uC2B5\uB2C8\uB2E4", "No valid schedule times")
     );
-    new import_obsidian.Setting(containerEl).setName("Catch up on startup").setDesc("When Obsidian starts, capture missed windows since the last pointer.").addToggle(
+    new import_obsidian.Setting(containerEl).setName(t("\uC2DC\uC791 \uC2DC \uB204\uB77D \uBCF4\uCDA9", "Catch up on startup")).setDesc(
+      t(
+        "Obsidian \uC2DC\uC791 \uC2DC \uB9C8\uC9C0\uB9C9 \uD3EC\uC778\uD130 \uC774\uD6C4 \uB193\uCE5C \uC708\uB3C4\uC6B0\uB97C \uBCF4\uCDA9 \uC218\uC9D1\uD569\uB2C8\uB2E4.",
+        "When Obsidian starts, capture missed windows since the last pointer."
+      )
+    ).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.startupCatchupEnabled).onChange(async (value) => {
         this.plugin.settings.startupCatchupEnabled = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Max catch-up windows per run").setDesc("Safety cap for one run. If missed windows are larger, the next tick keeps catching up.").addText(
+    new import_obsidian.Setting(containerEl).setName(t("1\uD68C \uC2E4\uD589\uB2F9 \uCD5C\uB300 \uBCF4\uCDA9 \uC708\uB3C4\uC6B0", "Max catch-up windows per run")).setDesc(
+      t(
+        "\uD55C \uBC88 \uC2E4\uD589\uC5D0\uC11C \uCC98\uB9AC\uD560 \uBCF4\uCDA9 \uC708\uB3C4\uC6B0 \uC0C1\uD55C\uC785\uB2C8\uB2E4. \uB204\uB77D\uC774 \uB354 \uB9CE\uC73C\uBA74 \uB2E4\uC74C \uD2F1\uC5D0\uC11C \uACC4\uC18D \uCC98\uB9AC\uD569\uB2C8\uB2E4.",
+        "Safety cap for one run. If missed windows are larger, the next tick keeps catching up."
+      )
+    ).addText(
       (text) => text.setPlaceholder("10").setValue(String(this.plugin.settings.maxCatchupWindowsPerRun)).onChange(async (value) => {
         const parsed = Number(value);
         if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 100) {
@@ -1595,28 +1777,110 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
         }
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Max items per window").setDesc("Quality-first fixed cap. RSS Insight always keeps top 20 items per window.").addText(
-      (text) => text.setPlaceholder(String(ENFORCED_MAX_ITEMS_PER_WINDOW)).setValue(String(ENFORCED_MAX_ITEMS_PER_WINDOW)).setDisabled(true)
+    new import_obsidian.Setting(containerEl).setName(t("\uAE30\uBCF8 \uCD5C\uB300 \uD56D\uBAA9 \uC218(\uC708\uB3C4\uC6B0\uB2F9)", "Base max items per window")).setDesc(
+      t(
+        "\uC790\uB3D9 \uD655\uC7A5 \uC801\uC6A9 \uC804, \uD488\uC9C8 \uC120\uBCC4\uC758 \uAE30\uBCF8 \uC0C1\uD55C\uC785\uB2C8\uB2E4.",
+        "Base target for quality-selected items before adaptive expansion."
+      )
+    ).addText(
+      (text) => text.setPlaceholder("20").setValue(String(this.plugin.settings.maxItemsPerWindow)).onChange(async (value) => {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed) && parsed >= MIN_BASE_ITEMS_PER_WINDOW && parsed <= MAX_BASE_ITEMS_PER_WINDOW) {
+          this.plugin.settings.maxItemsPerWindow = Math.floor(parsed);
+          if (this.plugin.settings.adaptiveItemCapMax < this.plugin.settings.maxItemsPerWindow) {
+            this.plugin.settings.adaptiveItemCapMax = this.plugin.settings.maxItemsPerWindow;
+          }
+          await this.plugin.saveSettings();
+          this.display();
+        }
+      })
     );
-    new import_obsidian.Setting(containerEl).setName("Output folder").setDesc("Vault-relative folder where capture notes are written.").addText(
+    new import_obsidian.Setting(containerEl).setName(t("\uCD5C\uB300 \uD56D\uBAA9 \uC790\uB3D9 \uD655\uC7A5", "Adaptive max items")).setDesc(
+      t(
+        "\uD65C\uC131 \uD53C\uB4DC/\uD1A0\uD53D \uC218\uC5D0 \uB530\uB77C \uC720\uD6A8 \uC0C1\uD55C\uC744 \uC790\uB3D9\uC73C\uB85C \uB298\uB9BD\uB2C8\uB2E4.",
+        "Auto-expand effective cap based on enabled feed/topic count."
+      )
+    ).addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.adaptiveItemCapEnabled).onChange(async (value) => {
+        this.plugin.settings.adaptiveItemCapEnabled = value;
+        await this.plugin.saveSettings();
+        this.display();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName(t("\uC790\uB3D9 \uD655\uC7A5 \uCD5C\uB300\uCE58", "Adaptive cap upper bound")).setDesc(
+      t(
+        "\uC790\uB3D9 \uD655\uC7A5\uC744 \uCF30\uC744 \uB54C \uC62C\uB77C\uAC08 \uC218 \uC788\uB294 \uCD5C\uB300 \uC0C1\uD55C\uC785\uB2C8\uB2E4.",
+        "Maximum effective cap when adaptive mode is enabled."
+      )
+    ).addText(
+      (text) => text.setPlaceholder("50").setValue(String(this.plugin.settings.adaptiveItemCapMax)).onChange(async (value) => {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed) && parsed >= this.plugin.settings.maxItemsPerWindow && parsed <= MAX_BASE_ITEMS_PER_WINDOW) {
+          this.plugin.settings.adaptiveItemCapMax = Math.floor(parsed);
+          await this.plugin.saveSettings();
+          this.display();
+        }
+      })
+    );
+    const enabledFeedsForPreview = this.plugin.settings.feeds.filter(
+      (feed) => feed.enabled && feed.url.trim().length > 0
+    );
+    const topicCountForPreview = new Set(
+      enabledFeedsForPreview.map((feed) => normalizeTopic(feed.topic || "Uncategorized"))
+    ).size;
+    new import_obsidian.Setting(containerEl).setName(t("\uC720\uD6A8 \uC0C1\uD55C \uBBF8\uB9AC\uBCF4\uAE30", "Effective cap preview")).setDesc(
+      t(
+        `\uD604\uC7AC: ${this.plugin.getEffectiveMaxItemsPreview()}\uAC1C (\uD65C\uC131 \uD53C\uB4DC: ${enabledFeedsForPreview.length}, \uD1A0\uD53D: ${topicCountForPreview})`,
+        `Now: ${this.plugin.getEffectiveMaxItemsPreview()} items (enabled feeds: ${enabledFeedsForPreview.length}, topics: ${topicCountForPreview})`
+      )
+    );
+    new import_obsidian.Setting(containerEl).setName(t("\uD1A0\uD53D\uBCC4 \uCD5C\uC18C \uD655\uBCF4 \uAC1C\uC218", "Topic diversity minimum per topic")).setDesc(
+      t(
+        "\uAC00\uC911\uCE58 \uCC44\uC6B0\uAE30 \uC804\uC5D0 \uD1A0\uD53D\uBCC4\uB85C \uCD5C\uC18C \uC774 \uAC1C\uC218\uB9CC\uD07C \uBA3C\uC800 \uD655\uBCF4\uD569\uB2C8\uB2E4.",
+        "Try to keep at least this many items per topic before weighted fill."
+      )
+    ).addText(
+      (text) => text.setPlaceholder("1").setValue(String(this.plugin.settings.topicDiversityMinPerTopic)).onChange(async (value) => {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed) && parsed >= MIN_TOPIC_DIVERSITY_PER_TOPIC && parsed <= MAX_TOPIC_DIVERSITY_PER_TOPIC) {
+          this.plugin.settings.topicDiversityMinPerTopic = Math.floor(parsed);
+          await this.plugin.saveSettings();
+        }
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName(t("\uD1A0\uD53D \uBD84\uC0B0 \uD398\uB110\uD2F0", "Topic diversity penalty")).setDesc(
+      t(
+        "\uAC12\uC774 \uB192\uC744\uC218\uB85D \uD1A0\uD53D \uBD84\uC0B0\uC774 \uAC15\uD574\uC9D1\uB2C8\uB2E4. 0\uC774\uBA74 \uC21C\uC218 \uD488\uC9C8 \uC21C\uC11C\uC785\uB2C8\uB2E4.",
+        "Higher value spreads topics more aggressively. 0 = pure quality order."
+      )
+    ).addText(
+      (text) => text.setPlaceholder("1.25").setValue(String(this.plugin.settings.topicDiversityPenaltyPerSelected)).onChange(async (value) => {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed) && parsed >= MIN_TOPIC_DIVERSITY_PENALTY && parsed <= MAX_TOPIC_DIVERSITY_PENALTY) {
+          this.plugin.settings.topicDiversityPenaltyPerSelected = Math.round(parsed * 100) / 100;
+          await this.plugin.saveSettings();
+        }
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName(t("\uCD9C\uB825 \uD3F4\uB354", "Output folder")).setDesc(t("\uC218\uC9D1 \uB178\uD2B8\uB97C \uC800\uC7A5\uD560 Vault \uAE30\uC900 \uD3F4\uB354\uC785\uB2C8\uB2E4.", "Vault-relative folder where capture notes are written.")).addText(
       (text) => text.setPlaceholder("000-Inbox/RSS").setValue(this.plugin.settings.outputFolder).onChange(async (value) => {
         this.plugin.settings.outputFolder = value.trim();
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Filename prefix").setDesc("Prefix used for generated note filenames.").addText(
+    new import_obsidian.Setting(containerEl).setName(t("\uD30C\uC77C\uBA85 \uC811\uB450\uC5B4", "Filename prefix")).setDesc(t("\uC0DD\uC131\uB418\uB294 \uB178\uD2B8 \uD30C\uC77C\uBA85 \uC55E\uBD80\uBD84\uC785\uB2C8\uB2E4.", "Prefix used for generated note filenames.")).addText(
       (text) => text.setPlaceholder("rss-capture").setValue(this.plugin.settings.filePrefix).onChange(async (value) => {
         this.plugin.settings.filePrefix = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Include description").setDesc("Add feed description/summary text under each item.").addToggle(
+    new import_obsidian.Setting(containerEl).setName(t("\uC124\uBA85 \uD3EC\uD568", "Include description")).setDesc(t("\uAC01 \uAE30\uC0AC \uC544\uB798\uC5D0 feed description/summary\uB97C \uD568\uAED8 \uAE30\uB85D\uD569\uB2C8\uB2E4.", "Add feed description/summary text under each item.")).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.includeDescription).onChange(async (value) => {
         this.plugin.settings.includeDescription = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Description max length").setDesc("Maximum characters for each description block.").addText(
+    new import_obsidian.Setting(containerEl).setName(t("\uC124\uBA85 \uCD5C\uB300 \uAE38\uC774", "Description max length")).setDesc(t("\uAC01 \uC124\uBA85 \uBE14\uB85D\uC758 \uCD5C\uB300 \uAE00\uC790 \uC218\uC785\uB2C8\uB2E4.", "Maximum characters for each description block.")).addText(
       (text) => text.setPlaceholder("500").setValue(String(this.plugin.settings.descriptionMaxLength)).onChange(async (value) => {
         const parsed = Number(value);
         if (Number.isFinite(parsed) && parsed > 0) {
@@ -1625,28 +1889,33 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
         }
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Write empty notes").setDesc("If enabled, create a note even when no items are found.").addToggle(
+    new import_obsidian.Setting(containerEl).setName(t("\uBE48 \uB178\uD2B8\uB3C4 \uC0DD\uC131", "Write empty notes")).setDesc(t("\uACB0\uACFC\uAC00 \uC5C6\uC5B4\uB3C4 \uB9AC\uD3EC\uD2B8 \uB178\uD2B8\uB97C \uC0DD\uC131\uD569\uB2C8\uB2E4.", "If enabled, create a note even when no items are found.")).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.writeEmptyNote).onChange(async (value) => {
         this.plugin.settings.writeEmptyNote = value;
         await this.plugin.saveSettings();
       })
     );
-    containerEl.createEl("h3", { text: "Translation" });
-    new import_obsidian.Setting(containerEl).setName("Enable translation").setDesc("Translate non-Korean items while writing notes.").addToggle(
+    containerEl.createEl("h3", { text: t("\uBC88\uC5ED", "Translation") });
+    new import_obsidian.Setting(containerEl).setName(t("\uBC88\uC5ED \uC0AC\uC6A9", "Enable translation")).setDesc(t("\uB178\uD2B8 \uC791\uC131 \uC2DC \uBE44\uD55C\uAE00 \uD56D\uBAA9\uC744 \uC790\uB3D9 \uBC88\uC5ED\uD569\uB2C8\uB2E4.", "Translate non-Korean items while writing notes.")).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.translationEnabled).onChange(async (value) => {
         this.plugin.settings.translationEnabled = value;
         await this.plugin.saveSettings();
         this.display();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Translation provider").setDesc("Web mode works without local AI. Ollama mode uses local model you choose.").addDropdown(
-      (dropdown) => dropdown.addOption("web", "Web translate (no local AI)").addOption("ollama", "Local Ollama").addOption("none", "Disabled").setValue(this.plugin.settings.translationProvider).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName(t("\uBC88\uC5ED \uC81C\uACF5\uC790", "Translation provider")).setDesc(
+      t(
+        "\uC6F9 \uBC88\uC5ED\uC740 \uB85C\uCEEC AI \uC5C6\uC774 \uB3D9\uC791\uD569\uB2C8\uB2E4. Ollama\uB294 \uC120\uD0DD\uD55C \uB85C\uCEEC \uBAA8\uB378\uC744 \uC0AC\uC6A9\uD569\uB2C8\uB2E4.",
+        "Web mode works without local AI. Ollama mode uses local model you choose."
+      )
+    ).addDropdown(
+      (dropdown) => dropdown.addOption("web", t("\uC6F9 \uBC88\uC5ED(\uB85C\uCEEC AI \uC5C6\uC74C)", "Web translate (no local AI)")).addOption("ollama", t("\uB85C\uCEEC Ollama", "Local Ollama")).addOption("none", t("\uC0AC\uC6A9 \uC548 \uD568", "Disabled")).setValue(this.plugin.settings.translationProvider).onChange(async (value) => {
         this.plugin.settings.translationProvider = value === "web" || value === "ollama" || value === "none" ? value : "web";
         await this.plugin.saveSettings();
         this.display();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Target language").setDesc("ISO code like ko, en, ja.").addText(
+    new import_obsidian.Setting(containerEl).setName(t("\uB300\uC0C1 \uC5B8\uC5B4", "Target language")).setDesc(t("ko, en, ja \uAC19\uC740 ISO \uCF54\uB4DC.", "ISO code like ko, en, ja.")).addText(
       (text) => text.setPlaceholder("ko").setValue(this.plugin.settings.translationTargetLanguage).onChange(async (value) => {
         const normalized = value.trim().toLowerCase();
         if (normalized) {
@@ -1655,32 +1924,32 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
         }
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Translate only non-Korean").setDesc("If enabled, text already containing Hangul is skipped.").addToggle(
+    new import_obsidian.Setting(containerEl).setName(t("\uBE44\uD55C\uAE00\uB9CC \uBC88\uC5ED", "Translate only non-Korean")).setDesc(t("\uD55C\uAE00\uC774 \uD3EC\uD568\uB41C \uD14D\uC2A4\uD2B8\uB294 \uBC88\uC5ED\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.", "If enabled, text already containing Hangul is skipped.")).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.translationOnlyNonKorean).onChange(async (value) => {
         this.plugin.settings.translationOnlyNonKorean = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Keep original text").setDesc("When translation is added, keep original description below it.").addToggle(
+    new import_obsidian.Setting(containerEl).setName(t("\uC6D0\uBB38 \uC720\uC9C0", "Keep original text")).setDesc(t("\uBC88\uC5ED\uC744 \uCD94\uAC00\uD560 \uB54C \uC6D0\uBB38 \uC124\uBA85\uC744 \uC544\uB798\uC5D0 \uD568\uAED8 \uC720\uC9C0\uD569\uB2C8\uB2E4.", "When translation is added, keep original description below it.")).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.translationKeepOriginal).onChange(async (value) => {
         this.plugin.settings.translationKeepOriginal = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Translate title").setDesc("Translate item titles.").addToggle(
+    new import_obsidian.Setting(containerEl).setName(t("\uC81C\uBAA9 \uBC88\uC5ED", "Translate title")).setDesc(t("\uAE30\uC0AC \uC81C\uBAA9\uC744 \uBC88\uC5ED\uD569\uB2C8\uB2E4.", "Translate item titles.")).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.translationTranslateTitle).onChange(async (value) => {
         this.plugin.settings.translationTranslateTitle = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Translate description").setDesc("Translate description/summary blocks.").addToggle(
+    new import_obsidian.Setting(containerEl).setName(t("\uC124\uBA85 \uBC88\uC5ED", "Translate description")).setDesc(t("description/summary \uBE14\uB85D\uC744 \uBC88\uC5ED\uD569\uB2C8\uB2E4.", "Translate description/summary blocks.")).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.translationTranslateDescription).onChange(async (value) => {
         this.plugin.settings.translationTranslateDescription = value;
         await this.plugin.saveSettings();
       })
     );
     if (this.plugin.settings.translationProvider === "web") {
-      new import_obsidian.Setting(containerEl).setName("Web translation endpoint").setDesc("Default endpoint usually works without API key.").addText(
+      new import_obsidian.Setting(containerEl).setName(t("\uC6F9 \uBC88\uC5ED \uC5D4\uB4DC\uD3EC\uC778\uD2B8", "Web translation endpoint")).setDesc(t("\uAE30\uBCF8 \uC5D4\uB4DC\uD3EC\uC778\uD2B8\uB294 \uBCF4\uD1B5 API \uD0A4 \uC5C6\uC774 \uB3D9\uC791\uD569\uB2C8\uB2E4.", "Default endpoint usually works without API key.")).addText(
         (text) => text.setPlaceholder("https://translate.googleapis.com/translate_a/single").setValue(this.plugin.settings.translationWebEndpoint).onChange(async (value) => {
           const normalized = normalizeHttpBaseUrl(value);
           if (normalized) {
@@ -1691,7 +1960,7 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
       );
     }
     if (this.plugin.settings.translationProvider === "ollama") {
-      new import_obsidian.Setting(containerEl).setName("Ollama base URL").setDesc("Example: http://127.0.0.1:11434").addText(
+      new import_obsidian.Setting(containerEl).setName(t("Ollama \uAE30\uBCF8 URL", "Ollama base URL")).setDesc(t("\uC608\uC2DC: http://127.0.0.1:11434", "Example: http://127.0.0.1:11434")).addText(
         (text) => text.setPlaceholder("http://127.0.0.1:11434").setValue(this.plugin.settings.ollamaBaseUrl).onChange(async (value) => {
           const normalized = normalizeHttpBaseUrl(value);
           if (normalized) {
@@ -1702,10 +1971,13 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
       );
       const modelOptions = this.plugin.getOllamaModelOptionsForUi();
       const recommendedModel = this.plugin.getRecommendedOllamaModelForUi();
-      const modelDescription = recommendedModel ? `Detected: ${modelOptions.length} / Recommended: ${recommendedModel}` : "No detected models yet. Click refresh first.";
-      new import_obsidian.Setting(containerEl).setName("Ollama model").setDesc(modelDescription).addDropdown((dropdown) => {
+      const modelDescription = recommendedModel ? t(
+        `\uD0D0\uC9C0\uB428: ${modelOptions.length} / \uCD94\uCC9C: ${recommendedModel}`,
+        `Detected: ${modelOptions.length} / Recommended: ${recommendedModel}`
+      ) : t("\uD0D0\uC9C0\uB41C \uBAA8\uB378\uC774 \uC5C6\uC2B5\uB2C8\uB2E4. \uBA3C\uC800 \uC0C8\uB85C\uACE0\uCE68\uD558\uC138\uC694.", "No detected models yet. Click refresh first.");
+      new import_obsidian.Setting(containerEl).setName(t("Ollama \uBAA8\uB378", "Ollama model")).setDesc(modelDescription).addDropdown((dropdown) => {
         if (modelOptions.length === 0) {
-          dropdown.addOption("", "(refresh models first)");
+          dropdown.addOption("", t("(\uBA3C\uC800 \uBAA8\uB378 \uC0C8\uB85C\uACE0\uCE68)", "(refresh models first)"));
         } else {
           for (const model of modelOptions) {
             dropdown.addOption(model, model);
@@ -1718,45 +1990,45 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
         });
         return dropdown;
       }).addButton(
-        (button) => button.setButtonText("Refresh models").onClick(async () => {
+        (button) => button.setButtonText(t("\uBAA8\uB378 \uC0C8\uB85C\uACE0\uCE68", "Refresh models")).onClick(async () => {
           await this.plugin.refreshOllamaModels(true);
           this.display();
         })
       );
-      new import_obsidian.Setting(containerEl).setName("Last model refresh").setDesc(this.plugin.settings.ollamaLastModelRefreshIso || "Not refreshed yet");
+      new import_obsidian.Setting(containerEl).setName(t("\uB9C8\uC9C0\uB9C9 \uBAA8\uB378 \uC0C8\uB85C\uACE0\uCE68", "Last model refresh")).setDesc(this.plugin.settings.ollamaLastModelRefreshIso || t("\uC544\uC9C1 \uC0C8\uB85C\uACE0\uCE68 \uC548 \uB428", "Not refreshed yet"));
     }
-    containerEl.createEl("h3", { text: "Filtering, Dedupe, Scoring" });
-    new import_obsidian.Setting(containerEl).setName("Enhanced dedupe").setDesc("Deduplicate across feeds using normalized link/title.").addToggle(
+    containerEl.createEl("h3", { text: t("\uD544\uD130\uB9C1 \xB7 \uC911\uBCF5\uC81C\uAC70 \xB7 \uC810\uC218", "Filtering, Dedupe, Scoring") });
+    new import_obsidian.Setting(containerEl).setName(t("\uACE0\uAE09 \uC911\uBCF5 \uC81C\uAC70", "Enhanced dedupe")).setDesc(t("\uC815\uADDC\uD654\uB41C \uB9C1\uD06C/\uC81C\uBAA9\uC744 \uC0AC\uC6A9\uD574 \uD53C\uB4DC \uAC04 \uC911\uBCF5\uC744 \uC81C\uAC70\uD569\uB2C8\uB2E4.", "Deduplicate across feeds using normalized link/title.")).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.enhancedDedupeEnabled).onChange(async (value) => {
         this.plugin.settings.enhancedDedupeEnabled = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Keyword filter").setDesc("Apply include/exclude keyword filter to collected items.").addToggle(
+    new import_obsidian.Setting(containerEl).setName(t("\uD0A4\uC6CC\uB4DC \uD544\uD130", "Keyword filter")).setDesc(t("\uC218\uC9D1 \uD56D\uBAA9\uC5D0 \uD3EC\uD568/\uC81C\uC678 \uD0A4\uC6CC\uB4DC \uD544\uD130\uB97C \uC801\uC6A9\uD569\uB2C8\uB2E4.", "Apply include/exclude keyword filter to collected items.")).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.keywordFilterEnabled).onChange(async (value) => {
         this.plugin.settings.keywordFilterEnabled = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Include keywords").setDesc("Comma or newline separated. Match any keyword.").addTextArea(
+    new import_obsidian.Setting(containerEl).setName(t("\uD3EC\uD568 \uD0A4\uC6CC\uB4DC", "Include keywords")).setDesc(t("\uC27C\uD45C \uB610\uB294 \uC904\uBC14\uAFC8\uC73C\uB85C \uAD6C\uBD84. \uD558\uB098\uB77C\uB3C4 \uB9E4\uCE6D\uB418\uBA74 \uD1B5\uACFC.", "Comma or newline separated. Match any keyword.")).addTextArea(
       (text) => text.setPlaceholder("ai, bitcoin, fed").setValue(this.plugin.settings.includeKeywords).onChange(async (value) => {
         this.plugin.settings.includeKeywords = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Exclude keywords").setDesc("Comma or newline separated. Exclude if matched.").addTextArea(
+    new import_obsidian.Setting(containerEl).setName(t("\uC81C\uC678 \uD0A4\uC6CC\uB4DC", "Exclude keywords")).setDesc(t("\uC27C\uD45C \uB610\uB294 \uC904\uBC14\uAFC8\uC73C\uB85C \uAD6C\uBD84. \uB9E4\uCE6D\uB418\uBA74 \uC81C\uC678.", "Comma or newline separated. Exclude if matched.")).addTextArea(
       (text) => text.setPlaceholder("sponsored, advertisement").setValue(this.plugin.settings.excludeKeywords).onChange(async (value) => {
         this.plugin.settings.excludeKeywords = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Score template").setDesc("Add default 4-factor score lines under each item.").addToggle(
+    new import_obsidian.Setting(containerEl).setName(t("\uC810\uC218 \uD15C\uD50C\uB9BF", "Score template")).setDesc(t("\uAC01 \uAE30\uC0AC \uC544\uB798\uC5D0 \uAE30\uBCF8 4\uC694\uC18C \uC810\uC218 \uB77C\uC778\uC744 \uCD94\uAC00\uD569\uB2C8\uB2E4.", "Add default 4-factor score lines under each item.")).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.scoreTemplateEnabled).onChange(async (value) => {
         this.plugin.settings.scoreTemplateEnabled = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Default score value").setDesc("Default value for Impact/Actionability/Timing/Confidence (1-5).").addText(
+    new import_obsidian.Setting(containerEl).setName(t("\uAE30\uBCF8 \uC810\uC218\uAC12", "Default score value")).setDesc(t("Impact/Actionability/Timing/Confidence\uC758 \uAE30\uBCF8\uAC12(1-5).", "Default value for Impact/Actionability/Timing/Confidence (1-5).")).addText(
       (text) => text.setPlaceholder("3").setValue(String(this.plugin.settings.scoreDefaultValue)).onChange(async (value) => {
         const parsed = Number(value);
         if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 5) {
@@ -1765,7 +2037,7 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
         }
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Action threshold").setDesc("Score total threshold reference for action candidates.").addText(
+    new import_obsidian.Setting(containerEl).setName(t("\uC561\uC158 \uC784\uACC4\uAC12", "Action threshold")).setDesc(t("\uC561\uC158 \uD6C4\uBCF4 \uD310\uB2E8\uC6A9 \uCD1D\uC810 \uAE30\uC900\uAC12\uC785\uB2C8\uB2E4.", "Score total threshold reference for action candidates.")).addText(
       (text) => text.setPlaceholder("14").setValue(String(this.plugin.settings.scoreActionThreshold)).onChange(async (value) => {
         const parsed = Number(value);
         if (Number.isFinite(parsed) && parsed > 0) {
@@ -1774,21 +2046,21 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
         }
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Last window pointer").setDesc(this.plugin.settings.lastWindowEndIso || "Not set yet").addButton(
-      (button) => button.setButtonText("Reset").onClick(async () => {
+    new import_obsidian.Setting(containerEl).setName(t("\uB9C8\uC9C0\uB9C9 \uC708\uB3C4\uC6B0 \uD3EC\uC778\uD130", "Last window pointer")).setDesc(this.plugin.settings.lastWindowEndIso || t("\uC544\uC9C1 \uC124\uC815\uB418\uC9C0 \uC54A\uC74C", "Not set yet")).addButton(
+      (button) => button.setButtonText(t("\uCD08\uAE30\uD654", "Reset")).onClick(async () => {
         this.plugin.settings.lastWindowEndIso = "";
         await this.plugin.saveSettings();
         this.display();
       })
     );
-    containerEl.createEl("h3", { text: "RSS Dashboard Sync" });
-    new import_obsidian.Setting(containerEl).setName("Enable RSS Dashboard sync").setDesc("Auto-import feed list from RSS Dashboard data.json.").addToggle(
+    containerEl.createEl("h3", { text: t("RSS Dashboard \uB3D9\uAE30\uD654", "RSS Dashboard Sync") });
+    new import_obsidian.Setting(containerEl).setName(t("RSS Dashboard \uB3D9\uAE30\uD654 \uC0AC\uC6A9", "Enable RSS Dashboard sync")).setDesc(t("RSS Dashboard data.json\uC758 \uD53C\uB4DC \uBAA9\uB85D\uC744 \uC790\uB3D9 \uAC00\uC838\uC635\uB2C8\uB2E4.", "Auto-import feed list from RSS Dashboard data.json.")).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.rssDashboardSyncEnabled).onChange(async (value) => {
         this.plugin.settings.rssDashboardSyncEnabled = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("RSS Dashboard data path").setDesc("Vault-relative path to RSS Dashboard settings file.").addText(
+    new import_obsidian.Setting(containerEl).setName(t("RSS Dashboard \uB370\uC774\uD130 \uACBD\uB85C", "RSS Dashboard data path")).setDesc(t("RSS Dashboard \uC124\uC815 \uD30C\uC77C\uC758 Vault \uAE30\uC900 \uACBD\uB85C\uC785\uB2C8\uB2E4.", "Vault-relative path to RSS Dashboard settings file.")).addText(
       (text) => text.setPlaceholder(".obsidian/plugins/rss-dashboard/data.json").setValue(this.plugin.settings.rssDashboardDataPath).onChange(async (value) => {
         this.plugin.settings.rssDashboardDataPath = value.trim() || DEFAULT_SETTINGS.rssDashboardDataPath;
         await this.plugin.saveSettings();
@@ -1797,16 +2069,19 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
     const syncedFeedCount = this.plugin.settings.feeds.filter(
       (feed) => feed.source === "rss-dashboard"
     ).length;
-    const syncStatus = this.plugin.settings.rssDashboardLastSyncAtIso ? `Last sync: ${this.plugin.settings.rssDashboardLastSyncAtIso} / synced feeds: ${syncedFeedCount}` : `No sync yet / synced feeds: ${syncedFeedCount}`;
-    new import_obsidian.Setting(containerEl).setName("Dashboard sync status").setDesc(syncStatus).addButton(
-      (button) => button.setButtonText("Sync now").onClick(async () => {
+    const syncStatus = this.plugin.settings.rssDashboardLastSyncAtIso ? t(
+      `\uB9C8\uC9C0\uB9C9 \uB3D9\uAE30\uD654: ${this.plugin.settings.rssDashboardLastSyncAtIso} / \uB3D9\uAE30\uD654 \uD53C\uB4DC: ${syncedFeedCount}`,
+      `Last sync: ${this.plugin.settings.rssDashboardLastSyncAtIso} / synced feeds: ${syncedFeedCount}`
+    ) : t(`\uC544\uC9C1 \uB3D9\uAE30\uD654 \uC548 \uB428 / \uB3D9\uAE30\uD654 \uD53C\uB4DC: ${syncedFeedCount}`, `No sync yet / synced feeds: ${syncedFeedCount}`);
+    new import_obsidian.Setting(containerEl).setName(t("\uB3D9\uAE30\uD654 \uC0C1\uD0DC", "Dashboard sync status")).setDesc(syncStatus).addButton(
+      (button) => button.setButtonText(t("\uC9C0\uAE08 \uB3D9\uAE30\uD654", "Sync now")).onClick(async () => {
         await this.plugin.syncFeedsFromRssDashboard(true, true);
         this.display();
       })
     );
-    containerEl.createEl("h3", { text: "Feeds" });
-    new import_obsidian.Setting(containerEl).setName("Add feed").setDesc("Add an RSS/Atom feed with a topic label.").addButton(
-      (button) => button.setButtonText("Add").onClick(async () => {
+    containerEl.createEl("h3", { text: t("\uD53C\uB4DC \uBAA9\uB85D", "Feeds") });
+    new import_obsidian.Setting(containerEl).setName(t("\uD53C\uB4DC \uCD94\uAC00", "Add feed")).setDesc(t("\uD1A0\uD53D \uB77C\uBCA8\uACFC \uD568\uAED8 RSS/Atom \uD53C\uB4DC\uB97C \uCD94\uAC00\uD569\uB2C8\uB2E4.", "Add an RSS/Atom feed with a topic label.")).addButton(
+      (button) => button.setButtonText(t("\uCD94\uAC00", "Add")).onClick(async () => {
         this.plugin.settings.feeds.push({
           id: createFeedId(),
           topic: "AI",
@@ -1821,20 +2096,20 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
     );
     if (this.plugin.settings.feeds.length === 0) {
       containerEl.createEl("p", {
-        text: "No feeds configured yet. Add at least one feed to start capturing."
+        text: t("\uC544\uC9C1 \uD53C\uB4DC\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4. \uC218\uC9D1\uC744 \uC2DC\uC791\uD558\uB824\uBA74 \uCD5C\uC18C 1\uAC1C \uD53C\uB4DC\uB97C \uCD94\uAC00\uD558\uC138\uC694.", "No feeds configured yet. Add at least one feed to start capturing.")
       });
       return;
     }
     this.plugin.settings.feeds.forEach((feed, index) => {
       const row = containerEl.createDiv({ cls: "rss-insight-feed-row" });
-      const sourceLabel = feed.source === "rss-dashboard" ? "RSS Dashboard sync" : "Manual";
-      new import_obsidian.Setting(row).setName(`Feed ${index + 1}`).setDesc(`${sourceLabel} / Enable or remove this feed.`).addToggle(
+      const sourceLabel = feed.source === "rss-dashboard" ? t("RSS Dashboard \uB3D9\uAE30\uD654", "RSS Dashboard sync") : t("\uC218\uB3D9", "Manual");
+      new import_obsidian.Setting(row).setName(`${t("\uD53C\uB4DC", "Feed")} ${index + 1}`).setDesc(`${sourceLabel} / ${t("\uC774 \uD53C\uB4DC\uB97C \uCF1C\uAC70\uB098 \uC0AD\uC81C\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4.", "Enable or remove this feed.")}`).addToggle(
         (toggle) => toggle.setValue(feed.enabled).onChange(async (value) => {
           feed.enabled = value;
           await this.plugin.saveSettings();
         })
       ).addExtraButton(
-        (button) => button.setIcon("trash").setTooltip("Delete feed").onClick(async () => {
+        (button) => button.setIcon("trash").setTooltip(t("\uD53C\uB4DC \uC0AD\uC81C", "Delete feed")).onClick(async () => {
           this.plugin.settings.feeds = this.plugin.settings.feeds.filter(
             (candidate) => candidate.id !== feed.id
           );
@@ -1842,19 +2117,19 @@ var RssWindowCaptureSettingTab = class extends import_obsidian.PluginSettingTab 
           this.display();
         })
       );
-      new import_obsidian.Setting(row).setName("Topic").setDesc("Used as section heading in output notes.").addText(
+      new import_obsidian.Setting(row).setName(t("\uD1A0\uD53D", "Topic")).setDesc(t("\uCD9C\uB825 \uB178\uD2B8\uC758 \uC139\uC158 \uC81C\uBAA9\uC73C\uB85C \uC0AC\uC6A9\uB429\uB2C8\uB2E4.", "Used as section heading in output notes.")).addText(
         (text) => text.setValue(feed.topic).onChange(async (value) => {
           feed.topic = normalizeTopic(value);
           await this.plugin.saveSettings();
         })
       );
-      new import_obsidian.Setting(row).setName("Feed name").setDesc("Display name for this source.").addText(
+      new import_obsidian.Setting(row).setName(t("\uD53C\uB4DC \uC774\uB984", "Feed name")).setDesc(t("\uC774 \uC18C\uC2A4\uC758 \uD45C\uC2DC \uC774\uB984\uC785\uB2C8\uB2E4.", "Display name for this source.")).addText(
         (text) => text.setValue(feed.name).onChange(async (value) => {
           feed.name = value.trim();
           await this.plugin.saveSettings();
         })
       );
-      new import_obsidian.Setting(row).setName("Feed URL").setDesc("RSS or Atom URL.").addText(
+      new import_obsidian.Setting(row).setName(t("\uD53C\uB4DC URL", "Feed URL")).setDesc(t("RSS \uB610\uB294 Atom URL.", "RSS or Atom URL.")).addText(
         (text) => text.setPlaceholder("https://example.com/rss").setValue(feed.url).onChange(async (value) => {
           feed.url = value.trim();
           await this.plugin.saveSettings();
