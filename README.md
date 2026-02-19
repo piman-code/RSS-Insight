@@ -13,11 +13,21 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 - 주제(Topic)별 섹션 정리
 - RSS + Atom 파싱
 - 수집 결과를 Vault 폴더에 Markdown 노트로 생성/갱신
+- frontmatter는 핵심 메타데이터만 최소 저장(한글 키)
 - 자동 실행(Obsidian 실행 중 분 단위 체크) + 수동 명령 실행
 - 시작 시 캐치업(앱이 꺼져 있던 동안 놓친 윈도우 자동 보충 수집)
 - 키워드 포함/제외 필터
 - 피드 간 중복 제거 강화(링크/제목 정규화)
-- 품질 점수 기반 선별 + 토픽 다양성 보정으로 기사 선택
+- 토픽 관련성 점수 필터(무관 기사 자동 제외)
+- 피드 토픽과 기사 내용이 강하게 어긋나면 자동 제외(토픽 불일치 필터)
+- 품질 점수 + 토픽 우선순위 가중치 + 토픽 다양성 보정으로 기사 선택
+- 선호/비선호 피드백 기반 개인 선호도 학습(수동 학습 실행)
+- 생성 노트 형식 미리보기 팝업
+- 간편 설정 모드(핵심 옵션만 노출) + 고급 옵션 토글
+- 우선순위 입력값과 실제 피드 목록의 토픽 매핑 상태를 실시간 표시
+- 피드 토픽 기준 우선순위 자동 동기화 버튼
+- 신뢰도 높은 추천 RSS 목록 미리보기 + 주제별 자동 추가(2개/3개)
+- 인터넷 검색 연동 보조 피드(Google News RSS 검색) 자동 추가
 - 기본 상한 + 구독 피드/토픽 규모 기반 자동 상한 확장
 - 기사별 4요소 점수 템플릿 자동 삽입
 - 영어 등 비한글 항목 자동 번역(웹 번역 또는 로컬 Ollama 선택)
@@ -36,13 +46,17 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 
 - `Auto fetch`: 자동 체크/수집 on/off
 - `Settings language`: 설정창 언어 전환(한국어/영문, 동시 표시는 안 함)
+- `Show advanced options`: 끄면 핵심 옵션만 표시(권장)
+- `Beginner preset`: 균형형/엄격형 1클릭 프리셋
+- `Topic feed count check`: 우선순위 6개 토픽 각각의 활성 피드 수를 `부족/적정/초과`로 표시(권장 2~3개)
 - `Schedule times`: `08:00,17:00` 형식
 - `Catch up on startup`: 시작 시 누락 윈도우 자동 보충
 - `Max catch-up windows per run`: 1회 실행당 보충 최대 윈도우 수
 - `Base max items per window`: 품질 선별 기본 상한
 - `Adaptive max items`: 구독 피드/토픽 수를 기준으로 상한 자동 확장
 - `Adaptive cap upper bound`: 자동 확장 시 최대 상한
-- `Topic diversity minimum per topic`: 토픽별 최소 확보 개수(0~3)
+- `Topic diversity minimum per topic`: 토픽별 최소 확보 개수(권장 2)
+- `Topic max items per topic`: 토픽별 최대 허용 개수(최대 3, 권장 3)
 - `Topic diversity penalty`: 토픽 편중 완화 가중치(높을수록 분산 강화)
 - `Output folder`: 노트 저장 폴더 (Vault 기준 경로)
 - `Filename prefix`: 생성 파일명 접두어
@@ -62,6 +76,18 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 - `Keyword filter`: 포함/제외 키워드 필터
 - `Include keywords`: 포함 키워드(쉼표/줄바꿈)
 - `Exclude keywords`: 제외 키워드(쉼표/줄바꿈)
+- `Topic relevance filter`: 토픽에 맞는 기사만 통과
+- `Minimum topic relevance score`: 토픽 필터 최소 점수(-2~10)
+- `Topic priority weighting`: 토픽 우선순위 가중치 사용
+- `Topic priority order`: 우선순위 토픽 순서(쉼표/줄바꿈)
+- `Applied priority preview`: 실제 인식된 우선순위 + 인식 불가 토큰 확인
+- `Live feed alignment`: 우선순위와 현재 피드 토픽의 실시간 정합성 확인
+- `Sync priority from feed topics`: 현재 피드 토픽 기준으로 우선순위 자동 채움
+- `Priority max boost`: 1순위 토픽 최대 가중치(0~12)
+- `Apply preference learning`: 선호도 학습 점수 적용
+- `Write feedback checkboxes`: 기사별 선호/비선호 체크박스 삽입
+- `Preference score weight`: 학습 점수 반영 강도
+- `Preference learning status`: 학습 토큰 수/마지막 학습 시각 + 학습 버튼
 - `Score template`: 점수 템플릿 삽입 여부
 - `Default score value`: 점수 기본값(1-5)
 - `Action threshold`: 액션 후보 기준 점수
@@ -69,6 +95,9 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 - `Enable RSS Dashboard sync`: RSS Dashboard에 추가한 피드를 자동 동기화 (기본값: 꺼짐)
 - `RSS Dashboard data path`: 기본값 `.obsidian/plugins/rss-dashboard/data.json`
 - `Feeds`: topic/name/url/enabled 관리
+- `Recommended feed status`: 우선순위 토픽별 추천 피드 반영 비율
+- `Auto add recommended RSS`: 추천 피드를 주제당 2개/3개로 자동 보강
+- `Add web-search feeds`: Google News 검색 RSS를 토픽별 보조 피드로 추가(고급 모드)
 
 ## Commands
 
@@ -76,6 +105,11 @@ AI 요약 없이 원문 메타데이터를 정리해 저장하는 용도에 맞�
 - `Capture latest completed RSS window now`
 - `Sync feeds from RSS Dashboard now`
 - `Refresh Ollama translation models`
+- `Refresh preference learning profile`
+- `Preview RSS note template`
+- `Preview recommended RSS feeds`
+- `Add recommended RSS feeds (target 2 per topic)`
+- `Add Google News search feeds by topic`
 
 ## RSS Dashboard 연동
 
